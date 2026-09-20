@@ -13,7 +13,8 @@
 // Weight formats: bf16, NVFP4, MXFP4, ds_fp4 and Q4_0 expert banks (see WFmt and
 // the per-format bank schemas). Compute is FP32-accumulate; the intermediate is
 // stored bf16 to match the GPU decode path. ISA is chosen once at construction
-// (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
+// (x86: AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar; aarch64:
+// NEON widening with optional BFDOT (bf16 dot) and SDOT (W4A8) add-ons -> scalar).
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +46,26 @@
 #define CPU_MOE_X86 1
 #else
 #define CPU_MOE_X86 0
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define CPU_MOE_AARCH64 1
+#if defined(__linux__)
+// Runtime ISA probing comes from getauxval -- aarch64 has no __builtin_cpu_supports.
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+// Older kernel headers predate these bits; the ABI values are stable, so define
+// them unless the headers did.
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+#ifndef HWCAP2_BF16
+#define HWCAP2_BF16 (1 << 14)
+#endif
+#endif
+#else
+#define CPU_MOE_AARCH64 0
 #endif
 
 namespace {
@@ -107,6 +128,61 @@ float dot_scalar(const bf16_t* w, const bf16_t* x, int n) {
 // weight stream is the bandwidth bottleneck (read once, never reused); nudging the
 // HW prefetcher with a few cache lines of lookahead raises sustained throughput.
 constexpr int PF_AHEAD = 512;
+
+// Spin-wait hint and software prefetch, shared by both ISAs: the flag handshake and
+// the barrier/coordinator spin loops run on aarch64 boxes too (Ampere One, Grace).
+inline void moe_pause() {
+#if CPU_MOE_X86
+  _mm_pause();
+#elif CPU_MOE_AARCH64
+  __asm__ volatile("yield" ::: "memory");
+#endif
+}
+
+inline void moe_prefetch(const void* p) {
+#if CPU_MOE_X86
+  _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0);
+#elif CPU_MOE_AARCH64
+  __builtin_prefetch(p, 0, 3);  // read, high temporal locality == T0
+#else
+  (void)p;
+#endif
+}
+
+#if CPU_MOE_AARCH64
+// Compile-time reachability of the extended intrinsics under per-function
+// target("arch=...") attributes (the single-portable-binary rule from setup.py:
+// no global -march). Runtime gating is separate (arm_has_* below): the binary must
+// still run on aarch64 cores without DOTPROD/BF16.
+#if (defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 8) || \
+    (defined(__clang__) && __clang_major__ >= 9)
+#define CPU_MOE_HAS_NEON_DOTPROD 1
+#endif
+#if (defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 10) || \
+    (defined(__clang__) && __clang_major__ >= 12)
+#define CPU_MOE_HAS_NEON_BF16 1
+#endif
+
+// Linux is the only aarch64 host known to this binary (the executor sits inside a
+// CUDA graph); elsewhere only the baseline-NEON kernels are used.
+inline bool arm_has_dotprod() {
+#if defined(__linux__) && defined(CPU_MOE_HAS_NEON_DOTPROD)
+  static const bool has = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+  return has;
+#else
+  return false;
+#endif
+}
+
+inline bool arm_has_bfdot() {
+#if defined(__linux__) && defined(CPU_MOE_HAS_NEON_BF16)
+  static const bool has = (getauxval(AT_HWCAP2) & HWCAP2_BF16) != 0;
+  return has;
+#else
+  return false;
+#endif
+}
+#endif  // CPU_MOE_AARCH64
 
 #if CPU_MOE_X86
 __attribute__((target("avx512f")))
@@ -213,6 +289,66 @@ float dot_avx2(const bf16_t* w, const bf16_t* x, int n) {
 }
 #endif  // CPU_MOE_X86
 
+#if CPU_MOE_AARCH64
+// Baseline NEON: the AVX2 widen-then-FMA shape at 128-bit width. bf16 -> fp32 is the
+// same zero-extend <<16 as bf16_to_f32 (vshll_n_u16 on 4 lanes). NEON is mandatory
+// on aarch64, so this kernel needs no runtime gate; the DOTPROD/BF16 add-ons below
+// are separate functions.
+static inline float32x4_t bf16x4_f32(const bf16_t* p) {
+  return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
+}
+
+float dot_neon(const bf16_t* w, const bf16_t* x, int n) {
+  // 4 independent accumulators: same memory-level-parallelism reasoning as the x86 kernels.
+  float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+  float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+  int i = 0;
+  for (; i + 32 <= n; i += 32) {
+    moe_prefetch(reinterpret_cast<const char*>(w + i) + PF_AHEAD);
+    for (int j = 0; j < 32; j += 8) {
+      const float32x4_t wlo = bf16x4_f32(w + i + j), whi = bf16x4_f32(w + i + j + 4);
+      const float32x4_t xlo = bf16x4_f32(x + i + j), xhi = bf16x4_f32(x + i + j + 4);
+      float32x4_t& acc = (j == 0) ? a0 : (j == 8) ? a1 : (j == 16) ? a2 : a3;
+      acc = vfmaq_f32(vfmaq_f32(acc, wlo, xlo), whi, xhi);
+    }
+  }
+  for (; i + 4 <= n; i += 4)
+    a0 = vfmaq_f32(a0, bf16x4_f32(w + i), bf16x4_f32(x + i));
+  float s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+  for (; i < n; ++i) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+  return s;
+}
+
+#ifdef CPU_MOE_HAS_NEON_BF16
+// HW bf16 dot pairs (BFDOT, FEAT_BF16; e.g. Ampere One), halving the widen+FMA op
+// count of dot_neon. Runtime-gated by arm_has_bfdot().
+__attribute__((target("arch=armv8.2-a+bf16")))
+float dot_neon_bfdot(const bf16_t* w, const bf16_t* x, int n) {
+  float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+  float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+  int i = 0;
+  for (; i + 64 <= n; i += 64) {
+    moe_prefetch(reinterpret_cast<const char*>(w + i) + PF_AHEAD);
+    for (int j = 0; j < 64; j += 16) {
+      const bfloat16x8_t w0 = vld1q_bf16(reinterpret_cast<const bfloat16_t*>(w + i + j));
+      const bfloat16x8_t x0 = vld1q_bf16(reinterpret_cast<const bfloat16_t*>(x + i + j));
+      const bfloat16x8_t w1 = vld1q_bf16(reinterpret_cast<const bfloat16_t*>(w + i + j + 8));
+      const bfloat16x8_t x1 = vld1q_bf16(reinterpret_cast<const bfloat16_t*>(x + i + j + 8));
+      float32x4_t& acc = (j == 0) ? a0 : (j == 16) ? a1 : (j == 32) ? a2 : a3;
+      acc = vbfdotq_f32(vbfdotq_f32(acc, w0, x0), w1, x1);
+    }
+  }
+  for (; i + 8 <= n; i += 8) {
+    a0 = vbfdotq_f32(a0, vld1q_bf16(reinterpret_cast<const bfloat16_t*>(w + i)),
+                     vld1q_bf16(reinterpret_cast<const bfloat16_t*>(x + i)));
+  }
+  float s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+  for (; i < n; ++i) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+  return s;
+}
+#endif  // CPU_MOE_HAS_NEON_BF16
+#endif  // CPU_MOE_AARCH64
+
 // --------------------------- NVFP4 (W4A16) dequant ---------------------------
 // Weights: e2m1 4-bit codes (2/byte, low nibble first), per-16 block scale in
 // fp8-e4m3, per-output-row global scale in fp16. Dequant matches the GPU kernels
@@ -312,6 +448,25 @@ using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t
     acc += (e4m3[scale[b]] * asb[b]) * (float)isum;
   }
   return acc * (0.5f * global);
+}
+
+// Software-prefetch distance for the W4A8 weight stream, in 16-K blocks (8 packed
+// bytes each). Returns -1 when FREETOKEN_CPU_MOE_PF_BLOCKS is unset: the kernel then
+// uses the built-in default min(512 blocks = 4 KB, 2 rows) -- 4 KB is the empirical
+// optimum on large-row machines (Emerald Rapids sweep), while the 2-row cap keeps a small-row
+// model's overshoot bounded (the executor works in 32-row tiles, so a fixed byte
+// distance otherwise prefetches another worker's tile: duplicated DRAM traffic that
+// regresses at the bandwidth ceiling). An EXPLICIT env value is honored verbatim
+// (no clamp; 0 disables): the per-machine optimum can sit past the safe default (+20%
+// at 4 KB on a 24-thread Ice Lake with 256B rows), so the escape hatch must reach it.
+// Prefetch never faults, so overshooting a row/bank tail is safe.
+// Hoisted out of the x86 guards: the aarch64 SDOT kernel shares the same knob.
+static int nvfp4_pf_blocks() {
+  static const int v = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_PF_BLOCKS");
+    return (s && s[0]) ? atoi(s) : -1;
+  }();
+  return v;
 }
 
 #if CPU_MOE_X86
@@ -453,24 +608,6 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
 #if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
 #define CPU_MOE_HAS_AVX512VNNI 1
 
-// Software-prefetch distance for the W4A8 weight stream, in 16-K blocks (8 packed
-// bytes each). Returns -1 when FREETOKEN_CPU_MOE_PF_BLOCKS is unset: the kernel then
-// uses the built-in default min(512 blocks = 4 KB, 2 rows) -- 4 KB is the empirical
-// optimum on large-row machines (Emerald Rapids sweep), while the 2-row cap keeps a small-row
-// model's overshoot bounded (the executor works in 32-row tiles, so a fixed byte
-// distance otherwise prefetches another worker's tile: duplicated DRAM traffic that
-// regresses at the bandwidth ceiling). An EXPLICIT env value is honored verbatim
-// (no clamp; 0 disables): the per-machine optimum can sit past the safe default (+20%
-// at 4 KB on a 24-thread Ice Lake with 256B rows), so the escape hatch must reach it.
-// Prefetch never faults, so overshooting a row/bank tail is safe.
-static int nvfp4_pf_blocks() {
-  static const int v = [] {
-    const char* s = getenv("FREETOKEN_CPU_MOE_PF_BLOCKS");
-    return (s && s[0]) ? atoi(s) : -1;
-  }();
-  return v;
-}
-
 // AVX-512 VNNI W4A8: FOUR 16-K blocks per VPDPBUSD (64 int8) -- 2x the AVX-VNNI
 // (256-bit) path. Decode 32 packed bytes -> 64 int8 with a single _mm512_shuffle_epi8
 // (e2m1*2 LUT replicated to all 4 128-bit lanes). AVX-512 has no _mm512_sign_epi8, so
@@ -564,6 +701,135 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 }
 #endif  // avx512vnni available
 #endif
+
+#if CPU_MOE_AARCH64
+// NEON NVFP4. The e2m1 decode is a vqtbl1q table lookup over the doubled-weight
+// int8 LUT (kE2M1x2, exact: every e2m1 value is a multiple of 0.5); the 0.5 folds
+// into the e4m3 block scale, which is exact (power of two). Baseline NEON suffices
+// for the fp32-activation (W4A16) kernel; the W4A8 kernel uses SDOT.
+
+static inline void i8x16_to_f32x4(int8x16_t v, float32x4_t out[4]) {
+  const int16x8_t lo = vmovl_s8(vget_low_s8(v));
+  const int16x8_t hi = vmovl_s8(vget_high_s8(v));
+  out[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+  out[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
+  out[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+  out[3] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
+}
+
+// Two adjacent 16-K blocks in one 16-byte load -> the two unscaled fp32 partial
+// vectors. Lane pairs track the block boundary: bytes 0..7 of the load are block b,
+// 8..15 are b+1, and the activation halves are 8 contiguous floats each.
+static inline void nvfp4_blk2_neon(const uint8_t* pk, const float* xeb, const float* xob,
+                                   const int8x16_t lut, float32x4_t* p0,
+                                   float32x4_t* p1) {
+  const uint8x16_t d = vld1q_u8(pk);
+  const int8x16_t wl = vqtbl1q_s8(lut, vandq_u8(d, vdupq_n_u8(0x0F)));  // even-K weights
+  const int8x16_t wh = vqtbl1q_s8(lut, vshrq_n_u8(d, 4));               // odd-K weights
+  float32x4_t wf[4], hf[4];
+  i8x16_to_f32x4(wl, wf);
+  i8x16_to_f32x4(wh, hf);
+  *p0 = vfmaq_f32(vmulq_f32(wf[0], vld1q_f32(xeb)), wf[1], vld1q_f32(xeb + 4));
+  *p0 = vfmaq_f32(*p0, hf[0], vld1q_f32(xob));
+  *p0 = vfmaq_f32(*p0, hf[1], vld1q_f32(xob + 4));
+  *p1 = vfmaq_f32(vmulq_f32(wf[2], vld1q_f32(xeb + 8)), wf[3], vld1q_f32(xeb + 12));
+  *p1 = vfmaq_f32(*p1, hf[2], vld1q_f32(xob + 8));
+  *p1 = vfmaq_f32(*p1, hf[3], vld1q_f32(xob + 12));
+}
+
+float dot_nvfp4_neon(const uint8_t* packed, const uint8_t* scale, float global,
+                     const float* xe, const float* xo, int K, const float* e2m1,
+                     const float* e4m3) {
+  const int8x16_t lut = vld1q_s8(kE2M1x2);
+  float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+  float32x4_t acc2 = vdupq_n_f32(0.0f), acc3 = vdupq_n_f32(0.0f);
+  const int nb = K / 16;
+  int b = 0;
+  for (; b + 4 <= nb; b += 4) {  // 4 blocks per iter -> 4 independent accumulator chains
+    moe_prefetch(reinterpret_cast<const char*>(packed + (size_t)b * 8) + PF_AHEAD);
+    float32x4_t p0, p1;
+    nvfp4_blk2_neon(packed + (size_t)b * 8, xe + (size_t)b * 8, xo + (size_t)b * 8,
+                    lut, &p0, &p1);
+    acc0 = vfmaq_n_f32(acc0, p0, e4m3[scale[b]] * 0.5f);
+    acc1 = vfmaq_n_f32(acc1, p1, e4m3[scale[b + 1]] * 0.5f);
+    nvfp4_blk2_neon(packed + (size_t)(b + 2) * 8, xe + (size_t)(b + 2) * 8,
+                    xo + (size_t)(b + 2) * 8, lut, &p0, &p1);
+    acc2 = vfmaq_n_f32(acc2, p0, e4m3[scale[b + 2]] * 0.5f);
+    acc3 = vfmaq_n_f32(acc3, p1, e4m3[scale[b + 3]] * 0.5f);
+  }
+  float s = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+  for (; b < nb; ++b) {  // tail (<4 blocks), scalar with the undoubled float LUT
+    const float bs = e4m3[scale[b]];
+    const uint8_t* pk = packed + (size_t)b * 8;
+    const float* xeb = xe + (size_t)b * 8;
+    const float* xob = xo + (size_t)b * 8;
+    float bsum = 0.0f;
+    for (int j = 0; j < 8; ++j) {
+      const uint8_t byte = pk[j];
+      bsum += e2m1[byte & 0xF] * xeb[j];
+      bsum += e2m1[byte >> 4] * xob[j];
+    }
+    s += bs * bsum;
+  }
+  return s * global;
+}
+
+#ifdef CPU_MOE_HAS_NEON_DOTPROD
+// W4A8: the doubled e2m1 weights are already int8, so one SDOT per 16-K block
+// consumes them directly -- no u8*s8 sign trick as on AVX-VNNI. The activation
+// layout [even(8) | odd(8)] matches the nibble interleave built here.
+__attribute__((target("arch=armv8.2-a+dotprod")))
+static inline int32_t nvfp4_i8_blk_sdot(const uint8_t* pk, const int8_t* a,
+                                        const int8x16_t lut) {
+  const uint8x8_t d = vld1_u8(pk);
+  const uint8x16_t nib = vcombine_u8(vand_u8(d, vdup_n_u8(0x0F)), vshr_n_u8(d, 4));
+  const int8x16_t w = vqtbl1q_s8(lut, nib);
+  const int32x4_t di = vdotq_s32(vdupq_n_s32(0), w, vld1q_s8(a));
+  return vaddvq_s32(di);
+}
+
+__attribute__((target("arch=armv8.2-a+dotprod")))
+float dot_nvfp4_i8_sdot(const uint8_t* packed, const uint8_t* scale, float global,
+                        const int8_t* asi8, int K, const float* e4m3, const float* asb) {
+  const int8x16_t lut = vld1q_s8(kE2M1x2);
+  const int nb = K / 16;
+  // Same FREETOKEN_CPU_MOE_PF_BLOCKS knob as the x86 kernels (see nvfp4_pf_blocks).
+  const int pfb = nvfp4_pf_blocks();
+  const int pf = (pfb < 0) ? std::min(512, 2 * nb) : pfb;
+  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+  int b = 0;
+  for (; b + 4 <= nb; b += 4) {  // 4 chains: hide vdotq latency, same role as the
+    if (pf > 0) {               // VNNI kernels' 4 groups
+      moe_prefetch(packed + ((size_t)b + (size_t)pf) * 8);
+      moe_prefetch(packed + ((size_t)b + (size_t)pf) * 8 + 64);
+    }
+    s0 += (e4m3[scale[b]] * asb[b]) *
+          (float)nvfp4_i8_blk_sdot(packed + (size_t)b * 8, asi8 + (size_t)b * 16, lut);
+    s1 += (e4m3[scale[b + 1]] * asb[b + 1]) *
+          (float)nvfp4_i8_blk_sdot(packed + (size_t)(b + 1) * 8,
+                                   asi8 + (size_t)(b + 1) * 16, lut);
+    s2 += (e4m3[scale[b + 2]] * asb[b + 2]) *
+          (float)nvfp4_i8_blk_sdot(packed + (size_t)(b + 2) * 8,
+                                   asi8 + (size_t)(b + 2) * 16, lut);
+    s3 += (e4m3[scale[b + 3]] * asb[b + 3]) *
+          (float)nvfp4_i8_blk_sdot(packed + (size_t)(b + 3) * 8,
+                                   asi8 + (size_t)(b + 3) * 16, lut);
+  }
+  float s = s0 + s1 + s2 + s3;
+  for (; b < nb; ++b) {  // tail (<4 blocks), identical to the x86 kernels
+    const uint8_t* pk = packed + (size_t)b * 8;
+    const int8_t* ae = asi8 + (size_t)b * 16;
+    const int8_t* ao = ae + 8;
+    int isum = 0;
+    for (int j = 0; j < 8; ++j)
+      isum += (int)kE2M1x2[pk[j] & 0xF] * (int)ae[j] +
+              (int)kE2M1x2[pk[j] >> 4] * (int)ao[j];
+    s += (e4m3[scale[b]] * asb[b]) * (float)isum;
+  }
+  return s * (0.5f * global);
+}
+#endif  // CPU_MOE_HAS_NEON_DOTPROD
+#endif  // CPU_MOE_AARCH64
 
 // =====================================================================================
 // CUDA stream memory operations (driver API, resolved via dlopen -- no link-time or
@@ -668,14 +934,25 @@ struct DotChoice {
   const char* name;
 };
 
-// SIMD tiers, ascending. Each format picks the highest tier <= the one chosen by
-// pick_isa() that it implements (fp4 formats have no bf16-specific tier, so the
-// avx512bf16 tier maps to their avx512 kernel).
-enum IsaTier { ISA_SCALAR = 0, ISA_AVX2 = 1, ISA_AVX512 = 2, ISA_AVX512BF16 = 3 };
+// SIMD tiers, ascending within each arch. Each format picks the highest tier <= the
+// one chosen by pick_isa() that it implements (fp4 formats have no bf16-specific
+// tier, so the avx512bf16 tier maps to their avx512 kernel). The aarch64 tiers are
+// independent constants: NEON is mandatory on aarch64, so ISA_NEON is the baseline
+// tier there and ISA_NEON_BFDOT marks the FEAT_BF16 dot add-on. Cross-arch order
+// never matters: pick_isa() only emits the running arch's tiers.
+enum IsaTier {
+  ISA_SCALAR = 0,
+  ISA_AVX2 = 1,
+  ISA_AVX512 = 2,
+  ISA_AVX512BF16 = 3,
+  ISA_NEON = 4,
+  ISA_NEON_BFDOT = 5,
+};
 
 // Best tier the CPU+build supports, optionally capped DOWN by
-// FREETOKEN_CPU_MOE_ISA={scalar,avx2,avx512,avx512bf16} (A/B testing on a machine
-// that supports more). FREETOKEN_CPU_MOE_SCALAR=1 forces scalar (legacy alias).
+// FREETOKEN_CPU_MOE_ISA (x86: scalar,avx2,avx512,avx512bf16; aarch64:
+// scalar,neon,neonbfdot) for A/B testing on a machine that supports more.
+// FREETOKEN_CPU_MOE_SCALAR=1 forces scalar (legacy alias) on both arches.
 inline IsaTier pick_isa() {
 #if CPU_MOE_X86
   if (getenv("FREETOKEN_CPU_MOE_SCALAR")) return ISA_SCALAR;
@@ -694,6 +971,18 @@ inline IsaTier pick_isa() {
     if (want < best) best = want;  // cap downward; never force above hw/build support
   }
   return best;
+#elif CPU_MOE_AARCH64
+  if (getenv("FREETOKEN_CPU_MOE_SCALAR")) return ISA_SCALAR;
+  IsaTier best = ISA_NEON;  // NEON is part of the aarch64 baseline
+  if (arm_has_bfdot()) best = ISA_NEON_BFDOT;
+  if (const char* f = getenv("FREETOKEN_CPU_MOE_ISA")) {
+    IsaTier want = best;
+    if (!std::strcmp(f, "scalar")) want = ISA_SCALAR;
+    else if (!std::strcmp(f, "neon")) want = ISA_NEON;
+    else if (!std::strcmp(f, "neonbfdot")) want = ISA_NEON_BFDOT;
+    if (want < best) best = want;  // cap downward; never force above hw/build support
+  }
+  return best;
 #else
   return ISA_SCALAR;
 #endif
@@ -707,6 +996,11 @@ DotChoice select_dot() {
 #endif
   if (t >= ISA_AVX512) return {dot_avx512f, "avx512f"};
   if (t >= ISA_AVX2) return {dot_avx2, "avx2"};
+#elif CPU_MOE_AARCH64
+#ifdef CPU_MOE_HAS_NEON_BF16
+  if (t >= ISA_NEON_BFDOT) return {dot_neon_bfdot, "neon-bfdot"};
+#endif
+  if (t >= ISA_NEON) return {dot_neon, "neon"};
 #endif
   (void)t;
   return {dot_scalar, "scalar"};
@@ -717,6 +1011,8 @@ nvdot_fn select_nvdot() {
 #if CPU_MOE_X86
   if (t >= ISA_AVX512) return dot_nvfp4_avx512;
   if (t >= ISA_AVX2) return dot_nvfp4_avx2;
+#elif CPU_MOE_AARCH64
+  if (t >= ISA_NEON) return dot_nvfp4_neon;
 #endif
   (void)t;
   return dot_nvfp4_scalar;
@@ -751,14 +1047,30 @@ inline bool cpu_has_avx512vnni() {
 #endif
 }
 
-// Best W4A8 (int8-activation) nvfp4 dot, or nullptr if no SIMD VNNI (caller keeps the
-// faithful fp32 nvdot path). The scalar i8 dot exists only as a correctness reference.
+// SDOT (FEAT_DotProd) availability: the aarch64 counterpart of the VNNI probes
+// above. Same FREETOKEN_CPU_MOE_NO_VNNI=1 kill switch on both arches, so existing
+// A/B scripts for the W4A8 family keep working unchanged.
+inline bool cpu_has_sdot() {
+#if CPU_MOE_AARCH64 && defined(CPU_MOE_HAS_NEON_DOTPROD)
+  const char* no = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
+  if (no && no[0] && no[0] != '0') return false;  // ignore unset/empty/"0"
+  return arm_has_dotprod();
+#else
+  return false;
+#endif
+}
+
+// Best W4A8 (int8-activation) nvfp4 dot, or nullptr if no SIMD dot-product engine
+// (caller keeps the faithful fp32 nvdot path). The scalar i8 dot exists only as a
+// correctness reference.
 nvi8dot_fn select_nvi8dot() {
 #if CPU_MOE_X86
 #if defined(CPU_MOE_HAS_AVX512VNNI)
   if (cpu_has_avx512vnni()) return dot_nvfp4_i8_avx512vnni;
 #endif
   if (cpu_has_avxvnni()) return dot_nvfp4_i8_vnni;
+#elif CPU_MOE_AARCH64 && defined(CPU_MOE_HAS_NEON_DOTPROD)
+  if (cpu_has_sdot()) return dot_nvfp4_i8_sdot;
 #endif
   return nullptr;
 }
@@ -858,11 +1170,71 @@ float dot_dsfp4_avx2(const uint8_t* packed, const uint8_t* scale, const float* x
 }
 #endif
 
+#if CPU_MOE_AARCH64
+// NEON ds_fp4: one 16-byte load covers a whole 32-K block. Same decode strategy as
+// the nvfp4 NEON kernel (vqtbl1q over the kE2M1x2 doubled-weight LUT, 0.5 folded
+// into the e8m0 scale -- exact, power of two); the score/acc ordering follows the
+// scalar reference (acc += sc * bsum).
+static inline float32x4_t dsfp4_blk_neon(const uint8_t* pk, const float* xeb,
+                                         const float* xob, const int8x16_t lut) {
+  const uint8x16_t d = vld1q_u8(pk);
+  const int8x16_t wl = vqtbl1q_s8(lut, vandq_u8(d, vdupq_n_u8(0x0F)));  // even-K weights
+  const int8x16_t wh = vqtbl1q_s8(lut, vshrq_n_u8(d, 4));               // odd-K weights
+  float32x4_t wf[4], hf[4];
+  i8x16_to_f32x4(wl, wf);
+  i8x16_to_f32x4(wh, hf);
+  float32x4_t pr = vmulq_f32(wf[0], vld1q_f32(xeb));
+  pr = vfmaq_f32(pr, wf[1], vld1q_f32(xeb + 4));
+  pr = vfmaq_f32(pr, wf[2], vld1q_f32(xeb + 8));
+  pr = vfmaq_f32(pr, wf[3], vld1q_f32(xeb + 12));
+  pr = vfmaq_f32(pr, hf[0], vld1q_f32(xob));
+  pr = vfmaq_f32(pr, hf[1], vld1q_f32(xob + 4));
+  pr = vfmaq_f32(pr, hf[2], vld1q_f32(xob + 8));
+  return vfmaq_f32(pr, hf[3], vld1q_f32(xob + 12));
+}
+
+float dot_dsfp4_neon(const uint8_t* packed, const uint8_t* scale, const float* xe,
+                     const float* xo, int K, const float* e2m1, const float* e8m0) {
+  const int8x16_t lut = vld1q_s8(kE2M1x2);
+  float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+  const int nb = K / 32;  // 16 packed bytes + one e8m0 scale per block
+  int b = 0;
+  for (; b + 2 <= nb; b += 2) {  // two independent accumulators, as the x86 kernels do
+    acc0 = vfmaq_n_f32(acc0,
+                       dsfp4_blk_neon(packed + (size_t)b * 16, xe + (size_t)b * 16,
+                                      xo + (size_t)b * 16, lut),
+                       e8m0[scale[b]] * 0.5f);
+    acc1 = vfmaq_n_f32(acc1,
+                       dsfp4_blk_neon(packed + (size_t)(b + 1) * 16,
+                                      xe + (size_t)(b + 1) * 16,
+                                      xo + (size_t)(b + 1) * 16, lut),
+                       e8m0[scale[b + 1]] * 0.5f);
+  }
+  float s = vaddvq_f32(vaddq_f32(acc0, acc1));
+  for (; b < nb; ++b) {  // tail (odd 32-K block), scalar with the undoubled LUT
+    const float sc = e8m0[scale[b]];
+    const uint8_t* pk = packed + (size_t)b * 16;
+    const float* xeb = xe + (size_t)b * 16;
+    const float* xob = xo + (size_t)b * 16;
+    float bsum = 0.0f;
+    for (int j = 0; j < 16; ++j) {
+      const uint8_t byte = pk[j];
+      bsum += e2m1[byte & 0xF] * xeb[j];
+      bsum += e2m1[byte >> 4] * xob[j];
+    }
+    s += sc * bsum;
+  }
+  return s;
+}
+#endif
+
 dsdot_fn select_dsdot() {
   const IsaTier t = pick_isa();
 #if CPU_MOE_X86
   if (t >= ISA_AVX512) return dot_dsfp4_avx512;
   if (t >= ISA_AVX2) return dot_dsfp4_avx2;
+#elif CPU_MOE_AARCH64
+  if (t >= ISA_NEON) return dot_dsfp4_neon;
 #endif
   (void)t;
   return dot_dsfp4_scalar;
@@ -1009,11 +1381,74 @@ void mxfp4_gemv_avx2(float* out, const uint8_t* blk, const uint8_t* scl, const b
 }
 #endif
 
+#if CPU_MOE_AARCH64
+// Same K-outer/N-inner structure as the AVX kernels at 16 columns per chunk
+// (4 x f32x4). The e2m1 decode reuses the doubled int8 LUT (kE2M1x2); the 0.5 is
+// folded into the per-32-K scale before the epilogue FMA (exact power of two).
+void mxfp4_gemv_neon(float* out, const uint8_t* blk, const uint8_t* scl, const bf16_t* x,
+                     int Kpairs, int N2, int ncol, const float* e2m1, const float* e8m0) {
+  (void)e2m1;  // decode comes from kE2M1x2; e8m0[s]=2^(s-127) built via s<<23
+  (void)e8m0;
+  const int8x16_t lut = vld1q_s8(kE2M1x2);
+  const uint8x16_t m0f = vdupq_n_u8(0x0F);
+  int c0 = 0;
+  for (; c0 + 16 <= ncol; c0 += 16) {
+    float32x4_t acc[4];
+    for (int j = 0; j < 4; ++j) acc[j] = vdupq_n_f32(0.0f);
+    for (int kblk = 0; kblk < Kpairs; kblk += 16) {  // 16 K-pairs = 32 K = one scale row
+      const uint8x16_t sv = vld1q_u8(scl + (size_t)(kblk >> 4) * N2 + c0);
+      const uint16x8_t s16l = vmovl_u8(vget_low_u8(sv));
+      const uint16x8_t s16h = vmovl_u8(vget_high_u8(sv));
+      float32x4_t sc[4];
+      sc[0] = vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_low_u16(s16l)), 23));
+      sc[1] = vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_high_u16(s16l)), 23));
+      sc[2] = vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_low_u16(s16h)), 23));
+      sc[3] = vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_high_u16(s16h)), 23));
+      float32x4_t blk_acc[4];
+      for (int j = 0; j < 4; ++j) blk_acc[j] = vdupq_n_f32(0.0f);
+      for (int kk = 0; kk < 16; ++kk) {
+        const int kb = kblk + kk;
+        const uint8_t* wbase = blk + (size_t)kb * N2 + c0;
+        constexpr int PFD = 8;
+        if (kb + PFD < Kpairs) moe_prefetch(blk + (size_t)(kb + PFD) * N2 + c0);
+        const float32x4_t xl = vdupq_n_f32(bf16_to_f32(x[2 * kb]));
+        const float32x4_t xh = vdupq_n_f32(bf16_to_f32(x[2 * kb + 1]));
+        const uint8x16_t wb = vld1q_u8(wbase);
+        float32x4_t wf[4], hf[4];
+        i8x16_to_f32x4(vqtbl1q_s8(lut, vandq_u8(wb, m0f)), wf);
+        i8x16_to_f32x4(vqtbl1q_s8(lut, vshrq_n_u8(wb, 4)), hf);
+        for (int j = 0; j < 4; ++j) {
+          blk_acc[j] = vfmaq_f32(blk_acc[j], wf[j], xl);
+          blk_acc[j] = vfmaq_f32(blk_acc[j], hf[j], xh);
+        }
+      }
+      for (int j = 0; j < 4; ++j)
+        acc[j] = vfmaq_f32(blk_acc[j], vmulq_n_f32(sc[j], 0.5f), acc[j]);
+    }
+    for (int j = 0; j < 4; ++j) vst1q_f32(out + c0 + j * 4, acc[j]);
+  }
+  for (int c = c0; c < ncol; ++c) {  // tail columns (< 16); none when ncol%16==0
+    float o = 0.0f;
+    for (int kb = 0; kb < Kpairs; ++kb) {
+      const uint8_t byte = blk[(size_t)kb * N2 + c];
+      uint32_t bits = (uint32_t)scl[(size_t)(kb >> 4) * N2 + c] << 23;
+      float sc;
+      std::memcpy(&sc, &bits, 4);
+      o += (e2m1[byte & 0xF] * bf16_to_f32(x[2 * kb]) +
+            e2m1[byte >> 4] * bf16_to_f32(x[2 * kb + 1])) * sc;
+    }
+    out[c] = o;
+  }
+}
+#endif
+
 mxgemv_fn select_mxgemv() {
   const IsaTier t = pick_isa();
 #if CPU_MOE_X86
   if (t >= ISA_AVX512) return mxfp4_gemv_avx512;
   if (t >= ISA_AVX2) return mxfp4_gemv_avx2;
+#elif CPU_MOE_AARCH64
+  if (t >= ISA_NEON) return mxfp4_gemv_neon;
 #endif
   (void)t;
   return mxfp4_gemv_scalar;
@@ -1207,14 +1642,44 @@ float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int
 }
 #endif  // CPU_MOE_X86
 
-// All tiers are W4A8 (int8 activations pre-quantized to Q8_0). AVX-VNNI is orthogonal to
-// the ISA tier (gated by cpu_has_avxvnni() / FREETOKEN_CPU_MOE_NO_VNNI), so it wins when
-// present; otherwise the 256-bit VPMADDUBSW kernel covers both the avx2 and avx512 tiers.
+#if CPU_MOE_AARCH64 && defined(CPU_MOE_HAS_NEON_DOTPROD)
+// aarch64 W4A8: SDOT is signed x signed, so the unpacked [-8,7] weights multiply the
+// int8 Q8_0 activations directly -- the x86 |w|*(sign(w)*a) sign trick exists only
+// because VPDPBUSD/VPMADDUBSW are unsigned x signed.
+__attribute__((target("arch=armv8.2-a+dotprod")))
+float q4_0_dot_i8_sdot(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const uint8x16_t m0f = vdupq_n_u8(0x0F);
+  const int8x16_t eight = vdupq_n_s8(8);
+  float32x4_t accF = vdupq_n_f32(0.0f);
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    moe_prefetch(blk + 512);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const int8_t* a = aq + (size_t)b * 32;
+    const uint8x16_t qb = vld1q_u8(blk + 2);
+    const int8x16_t wlo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qb, m0f)), eight);
+    const int8x16_t whi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qb, 4)), eight);
+    int32x4_t di = vdotq_s32(vdupq_n_s32(0), wlo, vld1q_s8(a));
+    di = vdotq_s32(di, whi, vld1q_s8(a + 16));
+    accF = vfmaq_f32(accF, vcvtq_f32_s32(di), vdupq_n_f32(fp16_to_f32(dh) * asb[b]));
+  }
+  return vaddvq_f32(accF);
+}
+#endif
+
+// All tiers are W4A8 (int8 activations pre-quantized to Q8_0). AVX-VNNI / SDOT are
+// orthogonal to the ISA tier (gated by cpu_has_avxvnni() / cpu_has_sdot(), both behind
+// FREETOKEN_CPU_MOE_NO_VNNI), so they win when present; otherwise the 256-bit
+// VPMADDUBSW kernel covers the x86 tiers and aarch64 falls back to scalar.
 q4dot_fn select_q4dot() {
   const IsaTier t = pick_isa();
 #if CPU_MOE_X86
   if (cpu_has_avxvnni()) return q4_0_dot_i8_vnni;
   if (t >= ISA_AVX2) return q4_0_dot_i8_avx2;
+#elif CPU_MOE_AARCH64 && defined(CPU_MOE_HAS_NEON_DOTPROD)
+  if (cpu_has_sdot()) return q4_0_dot_i8_sdot;
 #endif
   (void)t;
   return q4_0_dot_i8_scalar;
@@ -1390,15 +1855,20 @@ struct CpuMoeExecutor {
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
     }
     isa = c.name;
-    // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
-    // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
-    // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
+    // nvfp4 W4A8 int8 decode when the CPU supports it (AVX-VNNI on x86, SDOT on
+    // aarch64; select_nvi8dot returns nullptr when neither is present). q4_0 is always
+    // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD /
+    // VPMADDUBSW / SDOT / scalar, so the tag reflects the resolution.
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
-    const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
-    const char* vnni_tag =
-        cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
+    const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)"
+                                    : cpu_has_sdot()   ? "+sdot(q4_0-w4a8)"
+                                                       : "+q4_0-w4a8")
+                                 : "";
+    const char* vnni_tag = cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)"
+                           : cpu_has_sdot()       ? "+sdot(nvfp4-w4a8)"
+                                                  : "+vnni(nvfp4-w4a8)";
     isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
@@ -1572,9 +2042,7 @@ struct CpuMoeExecutor {
       bar_sense.store(local_sense);
     } else {
       while (bar_sense.load() != local_sense) {
-#if CPU_MOE_X86
-        _mm_pause();
-#endif
+        moe_pause();
       }
     }
   }
@@ -2073,9 +2541,7 @@ struct CpuMoeExecutor {
       if (!dozing) {
         if ((++empty_polls & 1023u) != 0 ||
             coord_clock::now() - last_active < kHotWindow) {
-#if CPU_MOE_X86
-          _mm_pause();
-#endif
+          moe_pause();
           continue;
         }
         dozing = true;

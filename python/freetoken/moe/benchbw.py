@@ -39,6 +39,7 @@ import contextlib
 import json
 import logging
 import os
+import platform
 import socket
 import statistics
 import threading
@@ -76,7 +77,11 @@ _SYNTH_BANK_BUDGET = 2 << 30
 
 # CPU MoE ISA tiers, forced via FREETOKEN_CPU_MOE_ISA (the kernel caps down to hw/build
 # support, so requesting a higher tier than the CPU has is safe -- it clamps).
-_ISA_TIERS = ("scalar", "avx2", "avx512", "avx512bf16")
+_ISA_TIERS = (
+    ("scalar", "neon", "neonbfdot")
+    if platform.machine() == "aarch64"
+    else ("scalar", "avx2", "avx512", "avx512bf16")
+)
 
 
 @contextlib.contextmanager

@@ -51,9 +51,10 @@ setup(
         ),
         # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
         # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
-        # use per-function target attributes (avx512bf16/avx512f) + a runtime
-        # __builtin_cpu_supports dispatch, so the single binary stays portable
-        # (scalar fallback) -- no global -march is set.
+        # use per-function target attributes (avx512bf16/avx512f on x86,
+        # arch=armv8.2-a+dotprod/+bf16 on aarch64) + a runtime dispatch
+        # (__builtin_cpu_supports on x86, getauxval(AT_HWCAP/2) on aarch64), so the
+        # single binary stays portable (scalar fallback) -- no global -march is set.
         CppExtension(
             name="freetoken.kernel._cpu_moe",
             sources=[

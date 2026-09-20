@@ -124,6 +124,42 @@ def _shard_dim1(tensor: torch.Tensor, *, rank: int, world_size: int) -> torch.Te
     return tensor.narrow(1, start, local).contiguous()
 
 
+def _shard_dim0(tensor: torch.Tensor, *, rank: int, world_size: int) -> torch.Tensor:
+    start, local = _partition(tensor.shape[0], rank, world_size)
+    return tensor.narrow(0, start, local).contiguous()
+
+
+def _shard_visual_qkv(tensor: torch.Tensor, *, num_heads: int, head_dim: int, rank: int, world_size: int) -> torch.Tensor:
+    q, k, v = torch.split(tensor, [num_heads * head_dim] * 3, dim=0)
+    return torch.cat([
+        _shard_head_rows(part, num_heads=num_heads, rows_per_head=head_dim, rank=rank, world_size=world_size)
+        for part in (q, k, v)
+    ], dim=0).contiguous()
+
+
+def _shard_visual_tensor(key: str, tensor: torch.Tensor, *, config, rank: int, world_size: int) -> torch.Tensor:
+    """Shard Qwen-VL vision projections to match their TP-aware layer shapes."""
+    if not key.startswith("visual.") or world_size == 1:
+        return tensor
+    vc = getattr(config, "vision_config", None)
+    if vc is None:
+        return tensor
+    if key.endswith((".attn.qkv.weight", ".attn.qkv.bias")):
+        return _shard_visual_qkv(
+            tensor, num_heads=vc.num_heads, head_dim=vc.hidden_size // vc.num_heads,
+            rank=rank, world_size=world_size,
+        )
+    if key.endswith((".attn.proj.weight", ".linear_fc2.weight")):
+        return _shard_dim1(tensor, rank=rank, world_size=world_size)
+    if key.endswith((".linear_fc1.weight", ".linear_fc1.bias")):
+        return _shard_dim0(tensor, rank=rank, world_size=world_size)
+    if key.endswith((".attn.proj.bias", ".linear_fc2.bias")):
+        # The row-parallel kernel adds bias before the SUM all-reduce. Only rank 0
+        # contributes it so the reduced output contains one copy, not world_size copies.
+        return tensor if rank == 0 else torch.zeros_like(tensor)
+    return tensor
+
+
 def shard_qwen4_exp_dense_tensor(
     key: str,
     tensor: torch.Tensor,
@@ -137,10 +173,14 @@ def shard_qwen4_exp_dense_tensor(
     Fusion happens after this function.  QSA q/k/v and GDN q/k/v/z/b/a therefore keep
     head boundaries, while row-parallel output projections are sliced on input columns.
     Routed experts, PLE/HC/indexer tensors and router weights are intentionally replicated;
-    expert-ID ownership belongs to the later EP stage.
+    expert-ID ownership belongs to the later EP stage. Vision projections follow the same
+    column/row and head sharding as their TP-aware layer implementations.
     """
     if world_size == 1:
         return tensor
+
+    if key.startswith("visual."):
+        return _shard_visual_tensor(key, tensor, config=config, rank=rank, world_size=world_size)
 
     linear = config.linear_attention_group()
     if key in {"model.embed_tokens.weight", "lm_head.weight"}:
@@ -431,11 +471,6 @@ def iter_weights(
             "path is TP1-only. Pass tp_shard=True to load a rank-local shard."
         )
     shard = tp_info.size > 1
-    if shard and include_vision:
-        raise NotImplementedError(
-            "Qwen4Exp vision tower weights are not tensor-parallel sharded; "
-            "start with --text-model-only"
-        )
     if shard and config is None:
         from freetoken.models.qwen4_exp.config import parse_config
 
@@ -497,8 +532,8 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
     """The vision tower alone, named as iter_weights names it."""
     if get_tp_info().size > 1:
         raise NotImplementedError(
-            "Qwen4Exp vision tower weights are not tensor-parallel sharded; "
-            "start with --text-model-only"
+            "Qwen4Exp encoder-only vision loading is TP1-only; "
+            "use iter_weights(tp_shard=True) for runtime TP"
         )
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:

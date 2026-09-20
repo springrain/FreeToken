@@ -19,6 +19,7 @@ from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseFuser,
+    iter_vision_weights,
     iter_weights,
     load_ple_table,
     shard_qwen4_exp_dense_tensor,
@@ -679,18 +680,126 @@ def test_iter_weights_tp_shard_is_opt_in_and_fails_fast_without_it(checkpoint, m
         )
 
 
-def test_iter_weights_tp_shard_rejects_unsharded_vision(checkpoint, monkeypatch):
+def test_encoder_only_vision_reader_rejects_tp2(checkpoint, monkeypatch):
     import freetoken.distributed.info as info
 
     folder, _raw = checkpoint
     monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=2))
-    with pytest.raises(NotImplementedError, match="vision tower weights"):
-        list(
-            iter_weights(
-                folder, torch.device("cpu"), include_moe_experts=False,
-                include_non_moe=True, include_vision=True, tp_shard=True,
+    with pytest.raises(NotImplementedError, match="encoder-only vision loading is TP1-only"):
+        list(iter_vision_weights(folder, torch.device("cpu")))
+
+
+def test_iter_weights_tp_shards_vision(checkpoint, monkeypatch):
+    import freetoken.distributed.info as info
+
+    folder, raw = checkpoint
+    config = SimpleNamespace(
+        num_qo_heads=QH,
+        num_kv_heads=KVH,
+        head_dim=AHD,
+        vision_config=SimpleNamespace(hidden_size=H, num_heads=4),
+        linear_attention_group=lambda: SimpleNamespace(
+            num_key_heads=KH, num_value_heads=VH, key_head_dim=HD, value_head_dim=HD,
+        ),
+    )
+    shards = []
+    for rank in range(2):
+        monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=rank, size=2))
+        shards.append(dict(iter_weights(
+            folder, torch.device("cpu"), include_moe_experts=False,
+            include_non_moe=True, include_vision=True, tp_shard=True, config=config,
+        )))
+
+    raw_qkv = raw["model.visual.blocks.0.attn.qkv.weight"]
+    local = [torch.split(s["visual.blocks.0.attn.qkv.weight"], H // 2, dim=0) for s in shards]
+    rebuilt = torch.cat([torch.cat([local[r][part] for r in range(2)]) for part in range(3)])
+    assert torch.equal(rebuilt, raw_qkv)
+    assert all(torch.equal(s["visual.merger.norm.weight"], raw["model.visual.merger.norm.weight"]) for s in shards)
+
+
+def test_tp2_vision_projection_shards_reassemble_and_bias_is_added_once():
+    vc = SimpleNamespace(
+        hidden_size=8, num_heads=4, intermediate_size=16,
+        spatial_merge_size=2, out_hidden_size=6,
+    )
+    config = SimpleNamespace(vision_config=vc, linear_attention_group=lambda: None)
+    merged = vc.hidden_size * vc.spatial_merge_size**2
+    shapes = {
+        "visual.patch_embed.proj.weight": (8, 3, 2, 2, 2),
+        "visual.pos_embed.weight": (16, 8),
+        "visual.blocks.0.norm1.weight": (8,),
+        "visual.blocks.0.attn.qkv.weight": (24, 8),
+        "visual.blocks.0.attn.qkv.bias": (24,),
+        "visual.blocks.0.attn.proj.weight": (8, 8),
+        "visual.blocks.0.attn.proj.bias": (8,),
+        "visual.blocks.0.mlp.linear_fc1.weight": (16, 8),
+        "visual.blocks.0.mlp.linear_fc1.bias": (16,),
+        "visual.blocks.0.mlp.linear_fc2.weight": (8, 16),
+        "visual.blocks.0.mlp.linear_fc2.bias": (8,),
+        "visual.merger.linear_fc1.weight": (merged, merged),
+        "visual.merger.linear_fc1.bias": (merged,),
+        "visual.merger.linear_fc2.weight": (6, merged),
+        "visual.merger.linear_fc2.bias": (6,),
+        "visual.deepstack_merger_list.0.linear_fc1.weight": (merged, merged),
+        "visual.deepstack_merger_list.0.linear_fc1.bias": (merged,),
+        "visual.deepstack_merger_list.0.linear_fc2.weight": (6, merged),
+        "visual.deepstack_merger_list.0.linear_fc2.bias": (6,),
+    }
+    raw = {
+        name: torch.arange(torch.tensor(shape).prod().item(), dtype=torch.float32).reshape(shape)
+        for name, shape in shapes.items()
+    }
+    shards = {
+        name: [
+            shard_qwen4_exp_dense_tensor(
+                name, tensor, config=config, rank=rank, world_size=2
             )
+            for rank in range(2)
+        ]
+        for name, tensor in raw.items()
+    }
+
+    for name in ("visual.patch_embed.proj.weight", "visual.pos_embed.weight", "visual.blocks.0.norm1.weight"):
+        assert all(torch.equal(part, raw[name]) for part in shards[name]), name
+    for name in (
+        "visual.blocks.0.mlp.linear_fc1.weight", "visual.blocks.0.mlp.linear_fc1.bias",
+        "visual.merger.linear_fc1.weight", "visual.merger.linear_fc1.bias",
+        "visual.deepstack_merger_list.0.linear_fc1.weight",
+        "visual.deepstack_merger_list.0.linear_fc1.bias",
+    ):
+        assert torch.equal(torch.cat(shards[name], dim=0), raw[name]), name
+    for name in (
+        "visual.blocks.0.attn.proj.weight", "visual.blocks.0.mlp.linear_fc2.weight",
+        "visual.merger.linear_fc2.weight", "visual.deepstack_merger_list.0.linear_fc2.weight",
+    ):
+        assert torch.equal(torch.cat(shards[name], dim=1), raw[name]), name
+    for name in (
+        "visual.blocks.0.attn.proj.bias", "visual.blocks.0.mlp.linear_fc2.bias",
+        "visual.merger.linear_fc2.bias", "visual.deepstack_merger_list.0.linear_fc2.bias",
+    ):
+        assert torch.equal(shards[name][0], raw[name]), name
+        assert torch.count_nonzero(shards[name][1]) == 0, name
+
+    for suffix in ("weight", "bias"):
+        name = f"visual.blocks.0.attn.qkv.{suffix}"
+        rows = vc.hidden_size // 2
+        local = [torch.split(part, rows, dim=0) for part in shards[name]]
+        rebuilt = torch.cat([torch.cat([local[r][group] for r in range(2)]) for group in range(3)])
+        assert torch.equal(rebuilt, raw[name])
+
+    x = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 10
+    full = torch.nn.functional.linear(
+        x, raw["visual.blocks.0.attn.proj.weight"], raw["visual.blocks.0.attn.proj.bias"]
+    )
+    partials = [
+        torch.nn.functional.linear(
+            x[:, rank * 4 : (rank + 1) * 4],
+            shards["visual.blocks.0.attn.proj.weight"][rank],
+            shards["visual.blocks.0.attn.proj.bias"][rank],
         )
+        for rank in range(2)
+    ]
+    torch.testing.assert_close(partials[0] + partials[1], full)
 
 
 # ======================================================================================

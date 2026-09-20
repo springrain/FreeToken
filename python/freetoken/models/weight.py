@@ -106,7 +106,7 @@ def iter_expert_tensors_parallel(
         try:
             for shard in shard_list:
                 path = os.path.join(model_path, shard)
-                if drop_cache:
+                if drop_cache and hasattr(os, "posix_fadvise"):
                     try:
                         fd = os.open(path, os.O_RDONLY)
                         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)

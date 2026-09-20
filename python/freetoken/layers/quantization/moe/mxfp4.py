@@ -22,10 +22,12 @@ class TritonMxfp4MoEKernel(MoEKernel):
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
-        return self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        if cfg.tp_size > 1 and cfg.intermediate % (GROUP * cfg.tp_size):
+            return f"TP sharding needs the MXFP4 intermediate divisible by {GROUP}*tp_size"
+        return self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), E8M0),
@@ -62,6 +64,10 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not cfg.has_bias:
             return "gpt-oss kernel needs the expert biases"
+        # banks size from floor(i/tp) while the gpt-oss sharder zero-pads to
+        # ceil(blocks/tp)*32; divisibility makes both windows agree
+        if cfg.tp_size > 1 and cfg.intermediate % (GROUP * cfg.tp_size):
+            return f"TP sharding needs the MXFP4 intermediate divisible by {GROUP}*tp_size"
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:

@@ -67,10 +67,22 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
+def _startup_kv_budget(
+    memory_ratio: float,
+    free_before_load: Tuple[int, int],
+    free_after_load: Tuple[int, int],
+    *,
+    tp_size: int,
+) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
-    what the resident model consumed. Kept as a pure function so the composition with the
-    pool families' ``solve_num_pages`` stays CPU-testable."""
+    what the resident model consumed, from the (min, max) cross-rank free pairs. Kept as a
+    pure function so the composition with the pool families' ``solve_num_pages`` stays
+    CPU-testable. TP ranks run identical schedules, so at tp>1 both endpoints must come
+    from the TIGHTEST rank -- a MAX endpoint re-adds the unscaled inter-rank imbalance and
+    the oversized pool OOMs that rank. At tp==1 min == max, so the picks are invisible."""
+    side = 0 if tp_size > 1 else 1
+    init_free_memory = free_before_load[side]
+    new_free_memory = free_after_load[side]
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
@@ -322,7 +334,9 @@ class Engine:
 
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
-        init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        # TP>1 startup sizing must fit the tightest rank: replicas schedule identically, so a
+        # rank with less free VRAM (display, another tenant) would OOM on the MAX baseline.
+        init_free_memory = free_min if config.tp_info.size > 1 else free_max
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
@@ -385,10 +399,12 @@ class Engine:
             )
 
         # ======================= KV cache initialization ========================
-        new_free = self._sync_get_memory()[1]
+        free_pair_now = self._sync_get_memory()
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
-        available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
+        available_memory = _startup_kv_budget(
+            config.memory_ratio, (free_min, free_max), free_pair_now, tp_size=config.tp_info.size
+        )
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size

@@ -63,6 +63,41 @@ ft serve --model ... --gpu 1             # by nvidia-smi index -- the 5090
 ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefix is enough)
 ```
 
+### Tensor parallelism (multi-GPU)
+
+`--tensor-parallel-size N` (alias `--tp-size`) shards the model across N GPUs: one process per
+rank, each holding 1/N of every sharded weight, with one all-reduce after each row-parallel
+layer. Scheduling, expert routers and norms stay replicated on every rank.
+
+```bash
+ft serve --model ... --tensor-parallel-size 2 --gpu 0,1
+```
+
+Each `--gpu` entry is one rank in order (entry 0 is rank 0); a mismatched count is a startup
+error. Omitting `--gpu` binds rank r to CUDA device r (rank 0 on device 0, rank 1 on device 1,
+...); pass explicit entries to pin ranks elsewhere.
+
+Supported today: dense bf16/fp16 models, deepseek-v4 MXFP4 checkpoints, and gpt-oss MXFP4
+variants. Other formats stay single-GPU.
+
+Quantized expert layers split along the expert intermediate size, which must stay divisible by
+the quant block per rank — a misaligned size fails loudly at model build:
+
+| Expert format | Requirement |
+|---|---|
+| MXFP4 (deepseek-v4, gpt-oss) | `intermediate` divisible by 32 × TP |
+| fp8 block | kernel opts in at `intermediate` divisible by 128 × TP, but every reachable fp8 expert reader (glm5_next, qwen3_5_moe) still rejects TP > 1 at load — fp8-block checkpoints stay single-GPU today |
+| NVFP4 | not yet — no NVFP4 expert reader shards by rank, so every NVFP4 kernel stays single-GPU |
+
+The inter-rank all-reduce uses PyNCCL (fp16/bf16) by default; `--disable-pynccl` falls back to
+torch.distributed. Ranks rendezvous on `tcp://127.0.0.1:2333`; to run two servers on one host,
+point one elsewhere via `FREETOKEN_DIST_ADDR`, e.g. `FREETOKEN_DIST_ADDR=tcp://127.0.0.1:2334`.
+Memory headroom is the MIN across ranks, so the rank with the least free VRAM sizes the whole
+engine.
+
+Only the serve path spawns rank processes: the offline Python API (`freetoken.llm`) stays
+TP=1 / single-GPU regardless of `--tensor-parallel-size`.
+
 ### KV cache & memory
 
 | Flag | Default | Meaning |

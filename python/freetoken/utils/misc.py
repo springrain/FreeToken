@@ -18,11 +18,17 @@ def call_if_main(name: str = "__main__", discard: bool | None = None):
 
 
 def div_even(a: int, b: int, allow_replicate: bool = False) -> int:
-    """Divides two integers. If allow_replicate=True, allows b > a when b % a == 0, returning 1."""
+    """Divides two integers, requiring exact division (tensor parallelism shard
+    geometry). If allow_replicate=True, allows b > a when b % a == 0, returning 1
+    (KV heads replicate across TP ranks instead of sharding)."""
     if allow_replicate and b > a:
-        assert b % a == 0, f"{b = } must be divisible by {a = } for KV head replication"
+        if b % a != 0:
+            raise ValueError(
+                f"KV head replication requires tp size divisible by num KV heads, got tp={b}, kv_heads={a}"
+            )
         return 1
-    assert a % b == 0, f"{a = } must be divisible by {b = }"
+    if a % b != 0:
+        raise ValueError(f"tensor parallel shard requires exact division, got {a} % {b} != 0")
     return a // b
 
 

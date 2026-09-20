@@ -277,7 +277,11 @@ def parse_args(
         "--tp-size",
         type=int,
         default=1,
-        help="The tensor parallelism size.",
+        help=(
+            "Tensor parallelism size: shards the model across this many GPUs (one process per "
+            "rank; give one --gpu entry per rank). Supported for dense bf16/fp16 models, "
+            "deepseek-v4 MXFP4 checkpoints, and gpt-oss MXFP4 variants."
+        ),
     )
 
     parser.add_argument(
@@ -785,8 +789,6 @@ def parse_args(
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
-        if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"

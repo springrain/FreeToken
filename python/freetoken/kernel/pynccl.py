@@ -53,7 +53,13 @@ def init_pynccl(
 
     max_size_bytes = min(max_size_bytes, ENV.PYNCCL_MAX_BUFFER_SIZE.value)
 
-    module = _load_nccl_module()
+    try:
+        module = _load_nccl_module()
+    except Exception as exc:
+        raise RuntimeError(
+            "PyNCCL failed to load (needs CUDA + NCCL to build pynccl.cu); "
+            "restart with --disable-pynccl to use the torch.distributed fallback"
+        ) from exc
     cls = _get_pynccl_wrapper_cls()
 
     if tp_rank == 0:

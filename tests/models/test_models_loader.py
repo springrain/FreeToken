@@ -7,28 +7,58 @@ import pytest
 import torch
 
 
+def test_shard_tensor_keeps_row_parallel_bias_on_rank_zero_only():
+    """A 1-D bias under a SPLIT_DIM_1 name (e.g. .o_proj.bias) is added inside
+    apply before the TP all-reduce, so it must exist on one rank only — and it
+    must not crash on chunk(dim=1)."""
+    from freetoken.models.loader import shard_tensor
+
+    value = torch.arange(8, dtype=torch.float32)
+
+    rank0 = shard_tensor(
+        "model.layers.0.self_attn.o_proj.bias", value, rank=0, world_size=2, num_kv_heads=1
+    )
+    rank1 = shard_tensor(
+        "model.layers.0.self_attn.o_proj.bias", value, rank=1, world_size=2, num_kv_heads=1
+    )
+
+    assert rank0.tolist() == value.tolist()
+    assert rank1.tolist() == torch.zeros_like(value).tolist()
+
+
+def test_shard_tensor_splits_row_parallel_weight_dim1():
+    from freetoken.models.loader import shard_tensor
+
+    value = torch.arange(3 * 8, dtype=torch.float32).reshape(3, 8)
+
+    rank0 = shard_tensor(
+        "model.layers.0.mlp.down_proj.weight", value, rank=0, world_size=2, num_kv_heads=1
+    )
+    rank1 = shard_tensor(
+        "model.layers.0.mlp.down_proj.weight", value, rank=1, world_size=2, num_kv_heads=1
+    )
+
+    assert torch.equal(torch.cat([rank0, rank1], dim=1), value)
+
+
 def test_shard_tensor_splits_vocab_with_ceil_partition():
+    """Every rank must yield div_ceil(V, tp) rows: VocabParallelEmbedding and
+    ParallelLMHead allocate that window on ALL ranks, so a short tail on the
+    last rank crashes load_state_dict; the pad rows stay zero (the head
+    truncates logits back to V)."""
     from freetoken.models.loader import shard_tensor
 
     value = torch.arange(5 * 2, dtype=torch.float32).reshape(5, 2)
 
-    rank0 = shard_tensor(
-        "model.embed_tokens.weight",
-        value,
-        rank=0,
-        world_size=2,
-        num_kv_heads=1,
-    )
-    rank1 = shard_tensor(
-        "model.embed_tokens.weight",
-        value,
-        rank=1,
-        world_size=2,
-        num_kv_heads=1,
-    )
+    for key in ("model.embed_tokens.weight", "lm_head.weight"):
+        rank0 = shard_tensor(key, value, rank=0, world_size=2, num_kv_heads=1)
+        rank1 = shard_tensor(key, value, rank=1, world_size=2, num_kv_heads=1)
 
-    assert rank0.tolist() == value[:3].tolist()
-    assert rank1.tolist() == value[3:5].tolist()
+        assert rank0.shape == (3, 2)
+        assert rank1.shape == (3, 2)
+        joined = torch.cat([rank0, rank1], dim=0)
+        assert torch.equal(joined[:5], value)
+        assert torch.equal(joined[5], torch.zeros(2))
 
 
 def test_iter_root_safetensor_files_from_index_keeps_only_root_index_shards(tmp_path):

@@ -41,6 +41,8 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        # stays TP-gated: no NVFP4 expert reader shards by rank yet, so opting
+        # in would load full pieces into rank-local banks (glm4_moe crash)
         reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason

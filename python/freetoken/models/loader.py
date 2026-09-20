@@ -38,13 +38,27 @@ def shard_tensor(
             return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
         return value.chunk(world_size, dim=0)[rank].clone()
     if any(key.count(sub) for sub in SPLIT_DIM_1):
+        if value.ndim == 1:
+            # row-parallel bias is added inside apply then all-reduced, so it must
+            # live on one rank only; chunk(dim=1) on a 1-D tensor also just crashes.
+            return value.clone() if rank == 0 else torch.zeros_like(value)
         return value.chunk(world_size, dim=1)[rank].clone()
     if key.count("lm_head") or key.count("embed_tokens"):
         num_embeddings = value.shape[0]
         num_embeddings_per_partition = div_ceil(num_embeddings, world_size)
         vocab_start_idx = rank * num_embeddings_per_partition
         vocab_end_idx = min((rank + 1) * num_embeddings_per_partition, num_embeddings)
-        return value[vocab_start_idx:vocab_end_idx, :].clone()
+        shard = value[vocab_start_idx:vocab_end_idx, :].clone()
+        if shard.shape[0] < num_embeddings_per_partition:
+            # VocabParallelEmbedding/ParallelLMHead allocate div_ceil(V, tp) rows on
+            # every rank, so the last rank's short tail must be zero-padded
+            # (the head truncates logits back to V, so pad rows never surface).
+            pad = torch.zeros(
+                num_embeddings_per_partition - shard.shape[0], value.shape[1],
+                dtype=value.dtype, device=value.device,
+            )
+            shard = torch.cat([shard, pad], dim=0)
+        return shard
     return value
 
 
@@ -73,6 +87,10 @@ def safetensors_weight_map(folder: str) -> dict[str, str]:
 
 def drop_page_cache(path: str) -> None:
     """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
+    # posix_fadvise is POSIX-only; on platforms without it (Windows) there is no cheap
+    # page-cache drop, so this quietly does nothing.
+    if not hasattr(os, "posix_fadvise"):
+        return
     try:
         fd = os.open(path, os.O_RDONLY)
         try:

@@ -95,20 +95,62 @@ def iter_weights(
 
     args = load_args(model_path, max_batch_size=1)
     reader = _ShardReader(model_path, _weight_map(model_path), device)
+    tp = get_tp_info()
+
+    def _tp_slice(t: torch.Tensor, dim: int, name: str, scale: torch.Tensor | None = None):
+        """Split dim 0 (column-parallel) or dim 1 (row-parallel) at this rank's window.
+
+        The fp8 block scale shards on the same axis at 128-block granularity, so a sharded
+        fp8 extent must stay 128-aligned per rank.
+        """
+        if tp.size == 1:
+            return t, scale
+        total = t.shape[dim]
+        if total % tp.size:
+            raise ValueError(f"TP shard of {name} needs dim{dim} divisible by tp_size, got {total} % {tp.size}")
+        part = total // tp.size
+        lo = tp.rank * part
+        t = (t[lo:lo + part] if dim == 0 else t[:, lo:lo + part]).clone()
+        if scale is not None:
+            if total % (128 * tp.size):
+                raise ValueError(
+                    f"TP shard of {name} fp8 scale needs 128-block alignment, got {total} % {128 * tp.size}"
+                )
+            slo, spart = lo // 128, part // 128
+            scale = (scale[slo:slo + spart] if dim == 0 else scale[:, slo:slo + spart]).clone()
+        return t, scale
+
+    def _vocab_shard(t: torch.Tensor) -> torch.Tensor:
+        # VocabParallelEmbedding / ParallelLMHead allocate div_ceil(V, tp) rows on
+        # every rank, so the last rank zero-pads its short tail; the head slices
+        # logits back to V after all-gather, so pad rows are never read.
+        if tp.size == 1:
+            return t
+        v = t.shape[0]
+        per = -(-v // tp.size)
+        lo = min(tp.rank * per, v)
+        shard = t[lo:min(lo + per, v)].clone()
+        if shard.shape[0] < per:
+            shard = torch.cat([shard, t.new_zeros((per - shard.shape[0],) + t.shape[1:])], dim=0)
+        return shard
 
     def get(name: str) -> torch.Tensor:
         return reader.get(name)
 
-    def linear(src: str, dst: str):
-        yield f"{dst}.weight", get(f"{src}.weight")
+    def linear(src: str, dst: str, shard_dim: int | None = None):
+        w = get(f"{src}.weight")
         # fp8 linears declare the e8m0 block scale under the quant method's role name
-        if reader.has(f"{src}.scale"):
-            yield f"{dst}.weight_scale_inv", get(f"{src}.scale")
+        scale = get(f"{src}.scale") if reader.has(f"{src}.scale") else None
+        if shard_dim is not None:
+            w, scale = _tp_slice(w, shard_dim, dst, scale)
+        yield f"{dst}.weight", w
+        if scale is not None:
+            yield f"{dst}.weight_scale_inv", scale
 
     try:
-        yield "model.embed.weight", get("embed.weight")
+        yield "model.embed.weight", _vocab_shard(get("embed.weight"))
         yield "model.norm.weight", get("norm.weight")
-        yield "model.head.weight", get("head.weight")
+        yield "model.head.weight", _vocab_shard(get("head.weight"))
         for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             yield f"model.{nm}", get(nm)
 
@@ -117,15 +159,34 @@ def iter_weights(
             m = f"model.{a}"
             yield from linear(f"{a}.wq_a", f"{m}.wq_a")
             yield f"{m}.q_norm.weight", get(f"{a}.q_norm.weight")
-            yield from linear(f"{a}.wq_b", f"{m}.wq_b")
+            # wq_b is column-parallel over heads; wkv and the latents stay replicated.
+            yield from linear(f"{a}.wq_b", f"{m}.wq_b", shard_dim=0)
             yield from linear(f"{a}.wkv", f"{m}.wkv")
             yield f"{m}.kv_norm.weight", get(f"{a}.kv_norm.weight")
-            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            yield f"{m}.wo_a", _dequant_fp8_block(
+            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum); TP
+            # shards its rows by whole output group to match Attention.wo_a's local layout.
+            wo_a = _dequant_fp8_block(
                 get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
             )
-            yield from linear(f"{a}.wo_b", f"{m}.wo_b")
-            yield f"{m}.attn_sink", get(f"{a}.attn_sink")
+            if tp.size > 1:
+                if args.o_groups % tp.size:
+                    raise ValueError(
+                        f"DeepSeek-V4 TP needs o_groups divisible by tp_size, got {args.o_groups} % {tp.size}"
+                    )
+                gpart = (args.o_groups // tp.size) * args.o_lora_rank
+                wo_a = wo_a[tp.rank * gpart:(tp.rank + 1) * gpart].clone()
+            yield f"{m}.wo_a", wo_a
+            # wo_b is row-parallel over the o_groups * o_lora_rank input columns.
+            yield from linear(f"{a}.wo_b", f"{m}.wo_b", shard_dim=1)
+            sink = get(f"{a}.attn_sink")
+            if tp.size > 1:
+                if args.n_heads % tp.size:
+                    raise ValueError(
+                        f"DeepSeek-V4 TP needs n_heads divisible by tp_size, got {args.n_heads} % {tp.size}"
+                    )
+                hpart = args.n_heads // tp.size
+                sink = sink[tp.rank * hpart:(tp.rank + 1) * hpart].clone()
+            yield f"{m}.attn_sink", sink
 
             ratio = args.compress_ratios[L]
             if ratio:
@@ -149,9 +210,12 @@ def iter_weights(
                 yield f"model.{g}.tid2eid", get(f"{g}.tid2eid")
             else:
                 yield f"model.{g}.bias", get(f"{g}.bias")
-            for proj in ("w1", "w2", "w3"):
+            # shared experts: w1/w3 column-parallel, w2 row-parallel (its partials all-reduce)
+            for proj in ("w1", "w3"):
                 src = f"layers.{L}.ffn.shared_experts.{proj}"
-                yield from linear(src, f"model.{src}")
+                yield from linear(src, f"model.{src}", shard_dim=0)
+            src = f"layers.{L}.ffn.shared_experts.w2"
+            yield from linear(src, f"model.{src}", shard_dim=1)
 
             for nm in (
                 "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
@@ -178,13 +242,20 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
     if kind is not QuantKind.MXFP4:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("DeepSeek-V4 expert banks support TP=1 only")
     from freetoken.models.weight import iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     args = load_args(model_path, max_batch_size=1)
     L, E = args.n_layers, args.n_routed_experts
+    tp = get_tp_info()
+    # each rank's intermediate window must be 32-aligned so its e8m0 scale columns stay whole
+    if tp.size > 1 and args.moe_inter_dim % (32 * tp.size):
+        raise ValueError(
+            "DeepSeek-V4 MXFP4 TP needs moe_inter_dim divisible by 32*tp_size, "
+            f"got {args.moe_inter_dim} % {32 * tp.size}"
+        )
+    part = args.moe_inter_dim // tp.size
+    lo, hi = tp.rank * part, (tp.rank + 1) * part
 
     def locate(raw_name: str):
         m = _EXPERT_RE.match(raw_name)
@@ -192,9 +263,36 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
             return None
         return int(m["layer"]), int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
 
+    def _shard_stream(tensors):
+        """Slice every raw expert tensor to this rank's intermediate window before packing.
+
+        gate/up shard rows (the [I, H//2] packed weight and the [I, H//32] scale alike); the
+        down weight shards columns at packed-pair granularity and its scale at 32-block
+        granularity, so the kernel banks see only local_intermediate-sized pieces.
+        """
+        if tp.size == 1:
+            return tensors
+
+        def _gen():
+            for name, t in tensors:
+                located = locate(name)
+                if located is None:
+                    yield name, t
+                    continue
+                role = located[2]
+                if role in ("gate", "up", "gate_scale", "up_scale"):
+                    t = t[lo:hi]
+                elif role == "down":
+                    t = t[:, lo // 2:hi // 2]
+                else:  # down_scale
+                    t = t[:, lo // 32:hi // 32]
+                yield name, t.clone()
+
+        return _gen()
+
     if parallel:
         tensors = iter_expert_tensors_parallel(model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk)
-        return per_expert_pieces(tensors, locate, tensors_per_expert=6)
+        return per_expert_pieces(_shard_stream(tensors), locate, tensors_per_expert=6)
 
     def _serial():
         reader = _ShardReader(model_path, _weight_map(model_path), torch.device("cpu"))
@@ -209,7 +307,7 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         finally:
             reader.close()
 
-    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
+    return per_expert_pieces(_shard_stream(_serial()), locate, tensors_per_expert=6)
 
 
 __all__ = ["iter_weights", "iter_expert_pieces"]

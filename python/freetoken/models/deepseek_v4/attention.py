@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
@@ -39,15 +40,26 @@ class Attention(BaseOP):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
 
-        self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
+        # TP shards whole attention heads, and output groups are head-aligned (K per group is
+        # unchanged), so a rank owns n_heads/tp heads and o_groups/tp groups; the latents, the
+        # shared kv projection and the compressor/indexer stay replicated.
+        tp = get_tp_info().size
+        if self.n_heads % tp:
+            raise ValueError(f"DeepSeek-V4 TP needs n_heads divisible by tp_size, got {self.n_heads} % {tp}")
+        if self.n_groups % tp:
+            raise ValueError(f"DeepSeek-V4 TP needs o_groups divisible by tp_size, got {self.n_groups} % {tp}")
+        self.n_heads_local = self.n_heads // tp
+        self.n_groups_local = self.n_groups // tp
+
+        self.attn_sink = torch.empty(self.n_heads_local, dtype=torch.float32)
         # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
         self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = LinearColParallelMerged(self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
         self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
-        wo_a_rows = self.n_groups * args.o_lora_rank
+        # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by whole group (K unchanged) like wo_b shards on K.
+        wo_a_rows = self.n_groups_local * args.o_lora_rank
         wo_a_k = self.n_heads * self.head_dim // self.n_groups
         self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
         self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
@@ -99,8 +111,8 @@ class Attention(BaseOP):
 
 
     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.n_groups, -1)
-        wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
+        o = o.reshape(bsz, seqlen, self.n_groups_local, -1)
+        wo_a = self.wo_a.view(self.n_groups_local, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
         return self.wo_b.forward(o)
 
@@ -183,7 +195,7 @@ class Attention(BaseOP):
             freqs = self._freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
 
         qr = q = self.q_norm.forward(self.wq_a.forward(x))
-        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads_local, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb(q[..., -rd:], freqs)
 
@@ -276,7 +288,7 @@ class Attention(BaseOP):
         freqs_t = self._freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
 
         qr = q = self.q_norm.forward(self.wq_a.forward(x))
-        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads_local, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb_decode(q[..., -rd:], freqs_t)  # per-row position freqs
 

@@ -35,4 +35,11 @@ def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+def reset_tp_info() -> None:
+    """Tests-only seam: set_tp_info is one-shot per process, so test suites that
+    monkeypatch different TP geometries across cases need a way to clear it."""
+    global _TP_INFO
+    _TP_INFO = None
+
+
+__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info", "reset_tp_info"]

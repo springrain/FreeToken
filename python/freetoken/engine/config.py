@@ -150,4 +150,7 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        # overridable so two engines (or a colliding tenant) can coexist on one host
+        import os
+
+        return os.environ.get("FREETOKEN_DIST_ADDR", "tcp://127.0.0.1:2333")

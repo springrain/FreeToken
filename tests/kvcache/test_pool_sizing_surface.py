@@ -117,8 +117,26 @@ def test_startup_kv_budget_composition():
     # mis-sizes every model's startup KV pool with the whole CPU suite green.
     from freetoken.engine.engine import _startup_kv_budget
 
-    assert _startup_kv_budget(0.9, 1000, 400) == int(0.9 * 1000) - 600
-    assert _startup_kv_budget(1.0, 1000, 1000) == 1000
+    assert _startup_kv_budget(0.9, (1000, 1000), (400, 400), tp_size=1) == int(0.9 * 1000) - 600
+    assert _startup_kv_budget(1.0, (1000, 1000), (1000, 1000), tp_size=1) == 1000
+
+
+def test_startup_kv_budget_uses_tightest_rank_under_tp():
+    """At tp>1 both budget endpoints must be the cross-rank MIN of their pair.
+    A MAX endpoint re-adds the unscaled inter-rank imbalance and oversizes KV:
+    tight rank free (12.0, 13.5) GiB -> after a 10 GiB load (2.0, 3.5) GiB, the
+    MAX-after budget was 3.5 - 0.1*12 = 2.3 GiB, more than the 2.0 GiB the
+    tight rank actually leaves. MIN-after gives 2.0 - 1.2 = 0.8 GiB."""
+    from freetoken.engine.engine import _startup_kv_budget
+
+    gib = 1024**3
+    before = (12 * gib, int(13.5 * gib))
+    after = (2 * gib, int(3.5 * gib))
+    budget = _startup_kv_budget(0.9, before, after, tp_size=2)
+    assert budget == int(0.9 * 12 * gib) - (12 - 2) * gib
+    assert 0 < budget <= after[0]
+    # single-GPU pairs are min == max, so tp==1 arithmetic is unchanged
+    assert _startup_kv_budget(0.9, before, after, tp_size=1) == int(0.9 * before[1]) - (before[1] - after[1])
 
 
 def test_generic_validate_rebuild_budget_check():

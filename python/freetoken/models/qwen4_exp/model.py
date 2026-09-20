@@ -39,6 +39,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
     from .gdn import Qwen4ExpGatedDeltaNet
 
+    quant = config.quant if config.attn_quant != "none" else None
     g = config.linear_attention_group()
     return Qwen4ExpGatedDeltaNet(
         hidden_size=config.hidden_size,
@@ -50,7 +51,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         rms_norm_eps=config.rms_norm_eps,
         layer_id=layer_id,
         output_gate=g.output_gate,
-        quant_config=config.quant,
+        quant_config=quant,
         prefix=prefix,
     )
 

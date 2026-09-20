@@ -9,7 +9,7 @@ from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
 )
-from freetoken.models.qwen4_exp.config import parse_config
+from freetoken.models.qwen4_exp.config import parse_config, qwen4_exp_tp_geometry
 
 from .common import LOVEDHEART_NVFP4_FP8, NVIDIA_NVFP4, QWEN_FP8, RADIXARK_NVFP4
 
@@ -135,6 +135,27 @@ def test_qwen4_args_payload():
     assert args.ngram_boundary_token_id == 248044
 
 
+def test_tp2_geometry_is_local_but_model_config_stays_global():
+    cfg = parse_config(_hf_config())
+    local = qwen4_exp_tp_geometry(cfg, tp_size=2, rank=1)
+    assert (local.num_q_heads, local.num_kv_heads) == (12, 1)
+    assert (local.num_key_heads, local.num_value_heads) == (8, 24)
+    assert local.q_attn_dim == 12 * 256
+    assert local.kv_attn_dim == 256
+    assert local.conv_dim == 2 * 8 * 128 + 24 * 128
+    assert local.local_conv_dim == local.conv_dim
+    assert local.local_recurrent_state_shape == (24, 128, 128)
+    assert cfg.num_qo_heads == 24 and cfg.num_kv_heads == 2
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_tp_geometry_rejects_non_divisible_dense_heads(tp_size):
+    cfg = parse_config(_hf_config())
+    geometry = qwen4_exp_tp_geometry(cfg, tp_size=tp_size, rank=0)
+    assert geometry.tp_size == tp_size
+    assert geometry.num_q_heads * tp_size == cfg.num_qo_heads
+
+
 def test_ple_on_full_attention_layer_rejected():
     hf = _hf_config()
     hf.text_config.ple_layer_ids = [4]  # one-indexed 4 == zero-based 3, a full_attention layer
@@ -182,6 +203,18 @@ def test_vision_turns_on_mrope_and_the_tower():
 def test_text_only_keeps_the_1d_rope():
     config = parse_config(_hf_config())
     assert not config.is_multimodal and not config.model_is_mrope and config.rotary_config.mrope_section is None
+
+
+def test_tp_rejects_mixed_fp8_outside_the_bf16_downgrade_path(monkeypatch):
+    from freetoken.distributed import info
+
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=2))
+    hf = _hf_config(LOVEDHEART_NVFP4_FP8)
+    hf.quantization_config["quantized_layers"][
+        "model.language_model.layers.0.self_attn.indexer.index_qk_proj"
+    ] = {"quant_algo": "FP8_PB_WO"}
+    with pytest.raises(NotImplementedError, match="outside the BF16-compatible"):
+        parse_config(hf)
 # the merged-projection prefixes the model asks the QuantConfig about (attention.py / gdn.py)
 DENSE_PREFIXES = (
     "model.layers.3.self_attn.qkv_proj", "model.layers.3.self_attn.o_proj",

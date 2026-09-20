@@ -350,7 +350,7 @@ def install_quant_config(model_path: str) -> None:
     set_quant_config(checkpoint_quant_config(model_path, hf, get_model_spec(hf.architectures[0])))
 
 
-def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
+def meta_state_dict(model_path: str, *, moe_ep_size: int = 1) -> dict[str, torch.Tensor]:
     """State dict of the model the engine builds for ``model_path`` (experts offloaded), on the meta device."""
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
@@ -361,10 +361,12 @@ def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
+    config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16,
+                          moe_strategy="offload", moe_ep_size=moe_ep_size,
                           mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
     object.__setattr__(config.model_config, "moe_strategy", "offload")
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
+    object.__setattr__(config.model_config, "moe_ep_size", moe_ep_size)
     saved = rotary._ROPE_DEVICE
     rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
     rotary.get_rope.cache_clear()

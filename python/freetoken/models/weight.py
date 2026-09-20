@@ -12,6 +12,7 @@ module; otherwise the defaults below (built purely from the parsed config) apply
 from __future__ import annotations
 
 import glob
+import inspect
 import json
 import mmap
 import os
@@ -212,6 +213,8 @@ def load_weight(
     *,
     include_moe_experts: bool = True,
     include_vision: bool = True,
+    tp_shard: bool = False,
+    tp_config=None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -224,19 +227,29 @@ def load_weight(
     # a text-only engine never built the tower, so its tensors are not even read
     keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
+        # FTW conversion is single-process and stores global dense tensors; it has no
+        # rank-layout metadata, so replaying it under TP would produce wrong shapes.
+        if tp_shard:
+            raise NotImplementedError(
+                "TP>1 loading from FTW checkpoints is unsupported; use the original "
+                "safetensors checkpoint or serve the FTW with tensor parallelism disabled"
+            )
         weights = iter_ftw_weights(model_path, keep=keep)
     else:
         _config, spec = _spec_for_model_path(model_path)
         iter_weights = _load_attr(spec.module, spec.iter_weights)
+        kwargs = dict(include_moe_experts=include_moe_experts, include_non_moe=True)
         # only a family that registers an encoder is asked about the tower; the others never load one
-        kwargs = {"include_vision": include_vision} if spec.encoders else {}
-        weights = iter_weights(
-            model_path,
-            device,
-            include_moe_experts=include_moe_experts,
-            include_non_moe=True,
-            **kwargs,
-        )
+        if spec.encoders:
+            kwargs["include_vision"] = include_vision
+        parameters = inspect.signature(iter_weights).parameters
+        if "tp_shard" in parameters:
+            # Readers declaring tp_shard slice raw checkpoint tensors themselves.
+            kwargs["tp_shard"] = tp_shard
+            if tp_config is not None and "config" in parameters:
+                kwargs["config"] = tp_config
+        # Other readers already shard internally and must not receive tp_shard.
+        weights = iter_weights(model_path, device, **kwargs)
     for name, tensor in weights:
         if keep is not None and not keep(name):
             continue

@@ -6,7 +6,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, List
 
 import torch
-from freetoken.distributed import DistributedInfo
+from freetoken.distributed import DistributedInfo, set_tp_info, try_get_tp_info
 from freetoken.layers.quantization import set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
@@ -23,6 +23,10 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Opt-in routed-expert owner group size.  1 preserves the legacy global-ID cache;
+    # values >1 require an explicit TP+EP runtime implementation and fail fast unless the
+    # model/quantizer supports the owner-local bank path.
+    moe_ep_size: int = 1
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
@@ -48,6 +52,17 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Per-(layer, expert) decode routing histogram (working-set / oracle-hit analysis).
+    # Accumulated on the DEVICE by a ``scatter_add_`` at the raw-ids point, so a captured
+    # decode graph replays it with every step -- this flag is CUDA-graph safe and does not
+    # require disabling graphs.
+    moe_collect_decode_freq: bool = False
+    # Ordered MoE route trace path (--moe-trace-route): when set, every
+    # ``ensure_experts`` call appends its RAW global expert ids (pre slot-rewrite)
+    # to this file for offline LRU/EP replay (moe/route_trace.py). Host-side, so it
+    # is NOT CUDA-graph safe -- the engine refuses it unless --cuda-graph-max-bs 0.
+    # None (default) = no recorder, zero overhead on the production path.
+    moe_trace_route: str | None = None
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
@@ -126,6 +141,16 @@ class EngineConfig:
 
     @cached_property
     def model_config(self) -> ModelConfig:
+        # Quantized model parsers consult the process TP state (notably Qwen4's
+        # mixed-FP8 downgrade). Keep it aligned even when a programmatic caller
+        # accesses this cached property before constructing Engine.
+        current_tp = try_get_tp_info()
+        if current_tp is None:
+            set_tp_info(rank=self.tp_info.rank, size=self.tp_info.size)
+        elif current_tp != self.tp_info:
+            raise RuntimeError(
+                f"TP info was initialized as {current_tp}, but EngineConfig requests {self.tp_info}"
+            )
         # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
         hf_config = copy.copy(self.hf_config)
         built = {e.config_key for e in self.active_encoders}

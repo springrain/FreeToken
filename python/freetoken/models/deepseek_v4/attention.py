@@ -3,18 +3,51 @@ top-k); owns the per-layer Compressor/Indexer instances."""
 
 from __future__ import annotations
 
+import logging
+import os
+
 import torch
 import torch.nn.functional as F
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
+from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
 from .layers import get_compress_topk_idxs, get_window_topk_idxs
 from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
+
+
+logger = init_logger(__name__)
+_TRACE = logger.isEnabledFor(logging.DEBUG)
+_TRACE_SYNC = os.getenv("FREETOKEN_DSV4_TRACE_SYNC", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+
+def _trace(message: str, *args) -> None:
+    if _TRACE:
+        logger.debug("[DSV4_TRACE] " + message, *args)
+
+
+def _trace_cuda(label: str, device: torch.device) -> None:
+    if not _TRACE:
+        return
+    if (
+        _TRACE_SYNC
+        and device.type == "cuda"
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        torch.cuda.synchronize(device)
+        _trace("%s complete (synchronized)", label)
+    elif _TRACE_SYNC and device.type == "cuda":
+        _trace("%s queued (capture; synchronization skipped)", label)
+    else:
+        _trace("%s queued", label)
 
 
 class Attention(BaseOP):
@@ -39,7 +72,35 @@ class Attention(BaseOP):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
 
-        self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
+        tp_size = get_tp_info().size
+        if self.n_heads % tp_size:
+            raise ValueError(
+                "DeepSeek-V4 TP needs n_heads divisible by tp_size, "
+                f"got {self.n_heads} % {tp_size}"
+            )
+        if self.n_groups % tp_size:
+            raise ValueError(
+                "DeepSeek-V4 TP needs o_groups divisible by tp_size, "
+                f"got {self.n_groups} % {tp_size}"
+            )
+        self.n_heads_local = self.n_heads // tp_size
+        self.n_groups_local = self.n_groups // tp_size
+
+        _trace(
+            "attention.init layer=%d heads=%d/%d groups=%d/%d ratio=%d window=%d "
+            "q_lora=%d head_dim=%d",
+            layer_id,
+            self.n_heads_local,
+            self.n_heads,
+            self.n_groups_local,
+            self.n_groups,
+            self.compress_ratio,
+            self.window_size,
+            self.q_lora_rank,
+            self.head_dim,
+        )
+
+        self.attn_sink = torch.empty(self.n_heads_local, dtype=torch.float32)
         # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
         self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
@@ -47,7 +108,7 @@ class Attention(BaseOP):
         self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
-        wo_a_rows = self.n_groups * args.o_lora_rank
+        wo_a_rows = self.n_groups_local * args.o_lora_rank
         wo_a_k = self.n_heads * self.head_dim // self.n_groups
         self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
         self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
@@ -83,9 +144,22 @@ class Attention(BaseOP):
         # only the pool HANDLE; buffers + slot maps are read off it per access via @property, so a
         # runtime pool rebuild needs no per-buffer unbind.
         L = self.layer_id
-        win = self.window_size
         self.P = pool.P
+        _trace(
+            "attention.bind layer=%d device=%s page_size=%d ratio=%d",
+            self.layer_id,
+            device,
+            self.P,
+            self.compress_ratio,
+        )
         self._freqs_cis = get_freqs_cis(*self._freqs_params, device)
+        _trace(
+            "attention.bind.freqs.ready layer=%d shape=%s dtype=%s bytes=%d",
+            self.layer_id,
+            tuple(self._freqs_cis.shape),
+            self._freqs_cis.dtype,
+            self._freqs_cis.numel() * self._freqs_cis.element_size(),
+        )
         if self.compress_ratio:
             self.compressor.bind_paged(pool, L, self._freqs_cis, device, tier="attn")
             if self.indexer is not None:
@@ -99,8 +173,8 @@ class Attention(BaseOP):
 
 
     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.n_groups, -1)
-        wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
+        o = o.reshape(bsz, seqlen, self.n_groups_local, -1)
+        wo_a = self.wo_a.view(self.n_groups_local, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
         return self.wo_b.forward(o)
 
@@ -116,11 +190,38 @@ class Attention(BaseOP):
         """
         win, ratio, device = self.window_size, self.compress_ratio, x_seg.device
         end = start_pos + n
+        _trace(
+            "segment.begin layer=%d table=%d start=%d n=%d end=%d ratio=%d",
+            self.layer_id,
+            ti,
+            start_pos,
+            n,
+            end,
+            ratio,
+        )
         slots = self.attn.window_slots_of(ti, start_pos, end)
+        _trace("window_slots.ready layer=%d shape=%s dtype=%s", self.layer_id, tuple(slots.shape), slots.dtype)
+        if _TRACE and _TRACE_SYNC and slots.numel():
+            _trace(
+                "window_slots.range layer=%d min=%d max=%d",
+                self.layer_id,
+                int(slots.min().item()),
+                int(slots.max().item()),
+            )
+        _trace("window.store.begin layer=%d", self.layer_id)
         self.attn.store_window(kv_seg, self.layer_id, slots)
+        _trace_cuda(f"window.store.done layer={self.layer_id}", device)
 
         if start_pos == 0:
-            win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
+            if _TRACE:
+                _trace("window_candidates.cpu.begin layer=%d n=%d width=%d", self.layer_id, n, min(n, win))
+                win_cols_cpu = get_window_topk_idxs(win, 1, n, 0)
+                _trace("window_candidates.cpu.done layer=%d shape=%s", self.layer_id, tuple(win_cols_cpu.shape))
+                _trace("window_candidates.h2d.begin layer=%d", self.layer_id)
+                win_cols = win_cols_cpu.to(device)
+                _trace_cuda(f"window_candidates.h2d.done layer={self.layer_id}", device)
+            else:
+                win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
             # natural width min(n, win); the caller pads to the batch-uniform width
             win_global = self.attn.win_cols_to_global(win_cols, slots)
         else:
@@ -134,6 +235,7 @@ class Attention(BaseOP):
             win_global = self.attn.win_cols_to_global(win_cols, ws_pool)
 
         if not ratio:
+            _trace("segment.done layer=%d table=%d ratio=0", self.layer_id, ti)
             return win_global, None
         # Only the compressor/indexer read the matched tail page's slot; resolving it costs a
         # host sync (.item()), so do it after the ratio-0 early-out.
@@ -143,19 +245,31 @@ class Attention(BaseOP):
         )
         if start_pos == 0:
             self.reset()  # re-seed the compressor/indexer carry from scratch
+            _trace("indexer.begin layer=%d table=%d", self.layer_id, ti)
             blocks = (
                 self.indexer.forward(x_seg, qr_seg, 0, 0, slots, ti) if self.indexer is not None
                 else get_compress_topk_idxs(ratio, 1, n, 0, 0).to(device)
             )
+            _trace_cuda(f"indexer.done layer={self.layer_id}", device)
+            _trace("compressor.begin layer=%d table=%d", self.layer_id, ti)
             self.compressor.forward(x_seg, 0, slots, ti=ti)
+            _trace_cuda(f"compressor.done layer={self.layer_id}", device)
         else:
+            _trace("indexer.extend.begin layer=%d table=%d start=%d", self.layer_id, ti, start_pos)
             blocks = (
                 self.indexer.extend(x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti)
                 if self.indexer is not None
                 else self._compress_topk_extend(n, start_pos, end, 0, device, 1)
             )
+            _trace_cuda(f"indexer.extend.done layer={self.layer_id}", device)
+            _trace("compressor.extend.begin layer=%d table=%d start=%d", self.layer_id, ti, start_pos)
             self.compressor.forward(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
-        return win_global, self.attn.blocks_to_global(blocks, ratio, ti=ti)
+            _trace_cuda(f"compressor.extend.done layer={self.layer_id}", device)
+        _trace("blocks_to_global.begin layer=%d table=%d shape=%s", self.layer_id, ti, tuple(blocks.shape))
+        result = self.attn.blocks_to_global(blocks, ratio, ti=ti)
+        _trace_cuda(f"blocks_to_global.done layer={self.layer_id}", device)
+        _trace("segment.done layer=%d table=%d compressed_shape=%s", self.layer_id, ti, tuple(result.shape))
+        return win_global, result
 
     def forward_ragged(self, x, segments, flat_positions):
         """Ragged batched prefill (cu_seqlens). ``x`` is [1, T, dim] -- the requests' NEW token
@@ -174,8 +288,8 @@ class Attention(BaseOP):
         (grid (T, head)). Each query gathers only its own request's slots, so requests are isolated.
         """
         win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
-        device = x.device
         _, T, _ = x.size()
+        _trace("layer.begin layer=%d tokens=%d segments=%s ratio=%d", self.layer_id, T, segments, ratio)
         if len(segments) == 1:
             # single contiguous segment: a free slice view instead of a per-layer gather
             freqs = self._freqs_cis[segments[0][3]:segments[0][3] + T]
@@ -183,7 +297,7 @@ class Attention(BaseOP):
             freqs = self._freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
 
         qr = q = self.q_norm.forward(self.wq_a.forward(x))
-        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads_local, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb(q[..., -rd:], freqs)
 
@@ -228,12 +342,17 @@ class Attention(BaseOP):
         # [1, T, win(+max_c)]; a 1-element cat would copy the whole list per layer for nothing
         topk_idxs = (flat[0] if len(flat) == 1 else torch.cat(flat, dim=1)).int()
 
+        _trace("attention.begin layer=%d topk_shape=%s n_window=%d", self.layer_id, tuple(topk_idxs.shape), n_window)
         o = self.attn.attend(
             q, self.layer_id, topk_idxs, n_window, self.attn_sink, self.softmax_scale,
             has_compression=bool(ratio),
         )
+        _trace_cuda(f"attention.done layer={self.layer_id}", x.device)
         apply_rotary_emb(o[..., -rd:], freqs, True)
-        return self._wo(o, 1, T)
+        out = self._wo(o, 1, T)
+        _trace_cuda(f"output_projection.done layer={self.layer_id}", x.device)
+        _trace("layer.done layer=%d tokens=%d", self.layer_id, T)
+        return out
 
     def _compress_topk_extend(self, seqlen, start_pos, end, offset, device, bsz):
         # ratio-128 layers (no indexer): each new query at abs pos p attends compressed blocks
@@ -264,6 +383,13 @@ class Attention(BaseOP):
         past each row's valid count are masked to -1 (the kernel ignores -1), so co-tenant rows
         stay isolated."""
         B = x.size(0)
+        _trace(
+            "decode.begin layer=%d batch=%d cmp_stage_cap=%s rows_shape=%s",
+            self.layer_id,
+            B,
+            cmp_stage_cap,
+            tuple(rows.shape),
+        )
         win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
         device = x.device
         n_cmp_stage = (cmp_stage_cap + 1) // ratio if ratio else 0
@@ -276,7 +402,7 @@ class Attention(BaseOP):
         freqs_t = self._freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
 
         qr = q = self.q_norm.forward(self.wq_a.forward(x))
-        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads_local, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb_decode(q[..., -rd:], freqs_t)  # per-row position freqs
 
@@ -320,5 +446,9 @@ class Attention(BaseOP):
             q, self.layer_id, topk_idxs, n_window, self.attn_sink, self.softmax_scale,
             cmp_counts=cmp_counts, has_compression=bool(ratio),
         )
+        _trace_cuda(f"decode.attention.done layer={self.layer_id}", device)
         apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)  # per-row position freqs (inverse)
-        return self._wo(o, B, 1)
+        out = self._wo(o, B, 1)
+        _trace_cuda(f"decode.output_projection.done layer={self.layer_id}", device)
+        _trace("decode.done layer=%d batch=%d", self.layer_id, B)
+        return out

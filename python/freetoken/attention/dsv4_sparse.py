@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.utils import init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .dsv4_compress import CompressorBackendMixin
@@ -41,6 +42,9 @@ from .dsv4_indexer import IndexerBackendMixin
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -195,6 +199,13 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         self.max_graph_bs = max(bs_list)
         self.capture = DSV4CaptureData.create(self.max_graph_bs, max_seq_len, self.device)
         self.capture_bs = sorted(bs_list)
+        logger.debug(
+            "[STARTUP] dsv4.capture.ready max_bs=%d stage_width=%d full_snap=%s bytes=%d",
+            self.max_graph_bs,
+            max_seq_len,
+            tuple(self.capture.full_snap.shape),
+            self.capture.full_snap.numel() * self.capture.full_snap.element_size(),
+        )
 
     def prepare_for_capture(self, batch: Batch) -> None:
         # The capture batch is all dummy rows; stage them so the captured gather reads the
@@ -249,6 +260,7 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         self, q: torch.Tensor, layer_id: int, topk_idxs: torch.Tensor, n_window: int,
         attn_sink: torch.Tensor, softmax_scale: float,
         cmp_counts: torch.Tensor | None = None, has_compression: bool = True,
+        cmp_layer_id: int | None = None,
     ) -> torch.Tensor:
         """Paged sparse MLA attention over ``[window | compressed]`` global slots.
 
@@ -260,7 +272,8 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         pool = self.pool
         # ratio-0 layers have no compressed pool; the kernel never reads it there (n_window ==
         # topk), so alias the window pool to keep the two-pool stride assert happy.
-        cmp = pool.cmp_pool[layer_id] if has_compression else pool.window_pool[layer_id]
+        source = layer_id if cmp_layer_id is None else cmp_layer_id
+        cmp = pool.cmp_pool[source] if has_compression else pool.window_pool[layer_id]
         return sparse_attn_paged(
             q, pool.window_pool[layer_id], cmp, attn_sink,
             topk_idxs.int(), n_window, softmax_scale, cmp_counts=cmp_counts,

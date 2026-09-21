@@ -21,7 +21,7 @@ import torch
 
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.config import EngineConfig
-from freetoken.layers import set_rope_device
+from freetoken.layers import LinearReplicated, set_rope_device
 from freetoken.layers.quantization import (
     CompressedTensorsConfig,
     Fp8BlockConfig,
@@ -50,6 +50,110 @@ MODELS = "/mnt/nvme/models"
 HF_CACHE = os.path.expanduser("~/.cache/huggingface/hub")
 
 BF16, FP8B, FP8T, MXFP8, NVFP4 = UnquantizedLinearMethod, Fp8BlockLinearMethod, Fp8TensorLinearMethod, Mxfp8LinearMethod, Nvfp4LinearMethod
+
+
+@pytest.mark.parametrize("block_size", [32, 128])
+def test_fp8_e8m0_square_block_declares_matching_scale_shape(block_size):
+    q = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [block_size, block_size],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+    }
+    quant = Fp8BlockConfig(q)
+    scheme = quant.scheme_for("model.layers.0.attn.wq_b")
+    assert scheme.weight.group == (block_size, block_size)
+    assert (
+        quant.scheme_for("model.layers.0.ffn.experts.0.w1").kind
+        is QuantKind.MXFP4
+    )
+
+    with torch.device("meta"):
+        layer = LinearReplicated(
+            input_size=2 * block_size,
+            output_size=3 * block_size,
+            has_bias=False,
+            quant_config=quant,
+            prefix="model.layers.0.attn.wq_b",
+        )
+    assert layer.quant_method.kernel.name == "dsv4"
+    assert layer.weight.shape == (3 * block_size, 2 * block_size)
+    assert layer.weight_scale_inv.shape == (3, 2)
+    assert layer.weight_scale_inv.dtype is torch.float8_e8m0fnu
+
+
+def test_dsv4_fp8_kernel_derives_block_size_from_rank_local_weights(monkeypatch):
+    from freetoken.layers.quantization.linear.fp8_block import Dsv4Fp8BlockLinearKernel
+
+    seen = {}
+
+    def fake_block_fp8_linear(x, weight, scale, bias, *, block_size):
+        seen["block_size"] = block_size
+        return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=x.dtype)
+
+    import freetoken.kernel.triton.dsv4.fp8_linear as fp8_linear
+
+    monkeypatch.setattr(fp8_linear, "block_fp8_linear", fake_block_fp8_linear)
+    layer = SimpleNamespace(
+        weight=torch.empty(96, 64),
+        weight_scale_inv=torch.empty(3, 2),
+        bias=None,
+    )
+    out = Dsv4Fp8BlockLinearKernel().apply(layer, torch.empty(1, 64))
+    assert out.shape == (1, 96)
+    assert seen["block_size"] == 32
+
+
+@pytest.mark.parametrize("block", ([32, 128], [64, 64]))
+def test_fp8_rejects_non_square_or_unknown_block_shape(block):
+    with pytest.raises(NotImplementedError, match="supported block sizes"):
+        Fp8BlockConfig(
+            {
+                "quant_method": "fp8",
+                "weight_block_size": block,
+                "scale_fmt": "ue8m0",
+            }
+        )
+
+
+@pytest.mark.parametrize("block", [16, 32])
+def test_dsv41_fp4_roundtrip_exposes_e4m3_scale_path(monkeypatch, block):
+    import inspect
+
+    from freetoken.kernel.triton.dsv4 import fp8_linear
+
+    params = inspect.signature(fp8_linear.fp4_act_quant_inplace).parameters
+    assert params["block"].default == 32
+    assert params["scale_dtype"].default is torch.float8_e8m0fnu
+    e4m3_params = inspect.signature(
+        fp8_linear.fp4_act_quant_e4m3_inplace
+    ).parameters
+    assert e4m3_params["block"].default == 16
+    assert "fp4_act_quant_e4m3_inplace" in fp8_linear.__all__
+
+    seen = {}
+
+    class _FakeKernel:
+        def __getitem__(self, grid):
+            seen["grid"] = grid
+
+            def launch(*args, **kwargs):
+                seen["args"] = args
+                seen["kwargs"] = kwargs
+
+            return launch
+
+    monkeypatch.setattr(fp8_linear, "_act_quant_inplace_kernel", _FakeKernel())
+    x = torch.empty(2, 2 * block)
+    assert fp8_linear.fp4_act_quant_e4m3_inplace(x, block) is x
+    assert seen["args"][-2:] == (True, True)
+    assert seen["kwargs"]["BLOCK"] == block
+
+    with pytest.raises(ValueError, match="supports block sizes"):
+        fp8_linear.fp4_act_quant_inplace(torch.empty(1, 64), 16)
+    with pytest.raises(ValueError, match="supports block sizes"):
+        fp8_linear.fp4_act_quant_e4m3_inplace(torch.empty(1, 64), 64)
 
 
 def model_dir(name: str) -> str | None:

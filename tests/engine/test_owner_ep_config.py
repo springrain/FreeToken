@@ -18,8 +18,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
-from freetoken.engine.engine import _validate_owner_ep_config
+from freetoken.engine.engine import (
+    _resolve_owner_ep_defaults,
+    _validate_owner_ep_config,
+)
 
 
 def _config(**over):
@@ -32,6 +34,12 @@ def _config(**over):
         moe_cache_auto=False,
         moe_cpu_layers=None,
         model_path="/models/unit-model",
+        model_config=SimpleNamespace(
+            model_type="qwen4_exp",
+            expert_quant="nvfp4",
+            owner_ep_expert_quants=("nvfp4",),
+            num_experts=512,
+        ),
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -42,12 +50,42 @@ def _not_ftw(monkeypatch):
     monkeypatch.setattr("freetoken.checkpoint.ftw.is_ftw_checkpoint", lambda path: False)
 
 
-def test_a_valid_owner_topology_passes():
-    _validate_owner_ep_config(_config())
+@pytest.mark.parametrize("size", [2, 3, 4, 5, 6, 8, 10, 12, 16])
+def test_owner_topology_accepts_any_divisible_group_size(size):
+    _validate_owner_ep_config(
+        _config(
+            moe_ep_size=size,
+            tp_info=SimpleNamespace(size=size, rank=0),
+            model_config=SimpleNamespace(
+                model_type="unit_owner_model",
+                expert_quant="test_format",
+                owner_ep_expert_quants=("test_format",),
+                num_experts=480,
+            ),
+        )
+    )
 
 
 def test_moe_cache_auto_satisfies_the_cache_requirement():
     _validate_owner_ep_config(_config(moe_cache_size=0, moe_cache_auto=True))
+
+
+def test_owner_ep_auto_resolves_to_offload_and_local_cache_auto():
+    config = _config(
+        moe_strategy="auto", moe_cache_size=0, moe_cache_auto=False
+    )
+    _resolve_owner_ep_defaults(config)
+    assert config.moe_strategy == "offload"
+    assert config.moe_cache_auto is True
+    _validate_owner_ep_config(config)
+
+
+def test_owner_ep_auto_preserves_an_explicit_cache_size():
+    config = _config(moe_strategy="auto", moe_cache_size=1024)
+    _resolve_owner_ep_defaults(config)
+    assert config.moe_strategy == "offload"
+    assert config.moe_cache_size == 1024
+    assert config.moe_cache_auto is False
 
 
 def test_ep_size_one_is_a_no_op(monkeypatch):
@@ -85,6 +123,45 @@ def test_a_non_offload_strategy_is_still_rejected():
         _validate_owner_ep_config(_config(moe_strategy="resident"))
 
 
-def test_a_topology_other_than_tp2_ep2_is_still_rejected():
-    with pytest.raises(ValueError, match="TP2"):
-        _validate_owner_ep_config(_config(tp_info=SimpleNamespace(size=4, rank=0)))
+def test_unsupported_model_format_is_rejected_before_allocation():
+    with pytest.raises(NotImplementedError, match="does not implement"):
+        _validate_owner_ep_config(
+            _config(
+                model_config=SimpleNamespace(
+                    model_type="other",
+                    expert_quant="nvfp4",
+                    owner_ep_expert_quants=(),
+                    num_experts=512,
+                )
+            )
+        )
+
+
+def test_expert_count_must_be_divisible_by_owner_group():
+    with pytest.raises(ValueError, match="num_experts divisible"):
+        _validate_owner_ep_config(
+            _config(
+                moe_ep_size=8,
+                tp_info=SimpleNamespace(size=8, rank=0),
+                model_config=SimpleNamespace(
+                    model_type="deepseek_v41",
+                    expert_quant="ds_fp4",
+                    owner_ep_expert_quants=("ds_fp4",),
+                    num_experts=10,
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("ep_size", "tp_size"),
+    [(2, 4), (4, 2), (4, 8), (8, 4)],
+)
+def test_owner_ep_size_must_equal_tp_size(ep_size, tp_size):
+    with pytest.raises(ValueError, match="must equal"):
+        _validate_owner_ep_config(
+            _config(
+                moe_ep_size=ep_size,
+                tp_info=SimpleNamespace(size=tp_size, rank=0),
+            )
+        )

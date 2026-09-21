@@ -4,9 +4,9 @@ Why this exists
 ---------------
 ``--moe-collect-decode-freq`` only yields a per-(layer, expert) HISTOGRAM. A
 histogram cannot reproduce LRU behaviour, adjacent-step overlap, or a miss
-forecast, because it has thrown away the ORDER of expert activations. The EP2
-capacity decision (does doubling unique slots actually cut miss, and by how much
-on the slow rank) needs the ordered sequence.
+forecast, because it has thrown away the ORDER of expert activations. EP capacity
+decisions (does partitioning unique experts actually cut misses, and by how much
+on the slow rank) need the ordered sequence.
 
 This module records the RAW global expert ids in call order -- captured at the
 same point ``collect_decode_freq`` snapshots them, i.e. BEFORE ``lru_ensure``
@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 _RECORD_HDR = struct.Struct("<bii")  # phase(int8), layer_id(int32), n(int32)
@@ -240,26 +241,42 @@ def replay(records, cache_size: int, num_experts: int, *, phase: int = 0,
     return lru.miss, lru.active, rate
 
 
-def replay_ep2(records, cache_sizes: tuple[int, int], num_experts: int, *, phase: int = 0):
-    """Replay both EP ranks; report per-rank miss and the per-step SLOW side.
+def replay_ep(
+    records,
+    cache_sizes: Sequence[int],
+    num_experts: int,
+    *,
+    phase: int = 0,
+):
+    """Replay an EP group; report each rank and the per-step slow side.
 
-    The decode step waits on max(rank0, rank1) per layer, so the slow-side miss
+    The decode step waits on the slowest rank per layer, so the slow-side miss
     (not the average) is what sets the step time. Returns a dict.
     """
-    half = num_experts // 2
-    ranks = [LRU(cache_sizes[r], half) for r in range(2)]
+    cache_sizes = tuple(cache_sizes)
+    world_size = len(cache_sizes)
+    if world_size < 2:
+        raise ValueError("EP replay needs at least 2 ranks")
+    if num_experts % world_size:
+        raise ValueError(
+            f"num_experts={num_experts} is not divisible by EP size={world_size}"
+        )
+    local_num_experts = num_experts // world_size
+    ranks = [LRU(cache_size, local_num_experts) for cache_size in cache_sizes]
     slow_miss = slow_active = 0
     for ph, layer, ids in records:
         if ph != phase:
             continue
         m0 = [r.miss for r in ranks]
         a0 = [r.active for r in ranks]
-        for r in range(2):
-            lo = r * half
-            loc = tuple(e - lo for e in ids if lo <= e < lo + half)
+        for r in range(world_size):
+            lo = r * local_num_experts
+            loc = tuple(
+                e - lo for e in ids if lo <= e < lo + local_num_experts
+            )
             ranks[r].ensure(layer, loc)
-        dm = [ranks[i].miss - m0[i] for i in range(2)]
-        da = [ranks[i].active - a0[i] for i in range(2)]
+        dm = [ranks[i].miss - m0[i] for i in range(world_size)]
+        da = [ranks[i].active - a0[i] for i in range(world_size)]
         slow_miss += max(dm)
         slow_active += max(da)
     return {
@@ -270,3 +287,8 @@ def replay_ep2(records, cache_sizes: tuple[int, int], num_experts: int, *, phase
         "slow_active": slow_active,
         "slow_rate": slow_miss / slow_active if slow_active else 0.0,
     }
+
+
+def replay_ep2(records, cache_sizes: tuple[int, int], num_experts: int, *, phase: int = 0):
+    """Compatibility wrapper for the original two-rank replay API."""
+    return replay_ep(records, cache_sizes, num_experts, phase=phase)

@@ -1,4 +1,4 @@
-"""DeepSeek-V4-Flash support for FreeToken.
+"""DeepSeek-V4 Flash/Pro support for FreeToken.
 
 This package ports the official ``inference/model.py`` reference (MLA + CSA/HCA
 compressors + Lightning Indexer + manifold-constrained Hyper-Connections) onto
@@ -7,7 +7,8 @@ FreeToken's primitives. The exotic ops are reimplemented as Triton kernels (see
 FreeToken's :class:`~freetoken.moe.offload_cache.OffloadMoeCache` so only a subset
 of experts is resident on the GPU (the framework's core acceleration).
 
-DeepSeek-V4-Flash is a first-class registered model on the shared paged-KV engine:
+DeepSeek-V4 Flash and Pro are registered through the same architecture and shared
+paged-KV engine:
 its window / compressed-attention / compressed-index KV live in DSV4-owned pools
 addressed by page tables, and sparse attention is a physical-slot gather (see
 :mod:`freetoken.attention.dsv4_sparse` and :mod:`freetoken.kvcache.dsv4_paged_pool`).

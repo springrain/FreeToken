@@ -48,6 +48,24 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
+### Multi-GPU TP/EP
+
+Use the same parallel group for dense tensor parallelism and routed-expert
+ownership:
+
+```bash
+ft serve --model <checkpoint> --tensor-parallel-size P --moe-ep-size P
+```
+
+`P` is not limited to a fixed set of values. The runtime accepts any `P >= 2`; a model can
+start when all of its sharded dimensions (attention heads, output groups,
+experts, shared projections, vision layers, and quantization blocks) are
+compatible with that value. With owner EP enabled, the default
+`--moe-strategy auto` resolves to `offload` and enables owner-local automatic
+cache sizing when no explicit cache size is given. See the Chinese
+[TP/EP model adaptation guide](tp-ep-model-adaptation.md) for the complete
+model-side checklist.
+
 ### Choosing a GPU
 
 For example, a machine with an RTX 5090 and an RTX 3060 Ti:
@@ -201,4 +219,3 @@ profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
-

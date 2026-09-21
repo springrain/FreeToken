@@ -107,20 +107,26 @@ class LinearQKVMerged(_LinearTPImpl):
         num_kv_heads: int,
         has_bias: bool,
         *,
+        q_head_dim: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
         tp_info = get_tp_info()
 
+        q_head_dim = head_dim if q_head_dim is None else q_head_dim
         local_num_qo = div_even(num_qo_heads, tp_info.size)
         local_num_kv = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
         full_isize = hidden_size
-        full_osize = (num_qo_heads + 2 * num_kv_heads) * head_dim
+        full_osize = num_qo_heads * q_head_dim + 2 * num_kv_heads * head_dim
         local_isize = hidden_size
-        local_osize = (local_num_qo + 2 * local_num_kv) * head_dim
+        local_osize = local_num_qo * q_head_dim + 2 * local_num_kv * head_dim
         super().__init__(
             full_isize, full_osize, local_isize, local_osize, has_bias,
-            output_sizes=[local_num_qo * head_dim, local_num_kv * head_dim, local_num_kv * head_dim],
+            output_sizes=[
+                local_num_qo * q_head_dim,
+                local_num_kv * head_dim,
+                local_num_kv * head_dim,
+            ],
             quant_config=quant_config, prefix=prefix,
         )
 

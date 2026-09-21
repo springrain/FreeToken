@@ -331,6 +331,27 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=2048,
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
+        aliases=("deepseek-ai/DeepSeek-V4-Flash-0731",),
+    ),
+    AotModel(
+        name="deepseek-ai/DeepSeek-V4-Pro",
+        architecture="DeepseekV4ForCausalLM",
+        hidden_size=7168,
+        kv_groups=(),  # same MLA sparse-attention path as V4-Flash
+        top_k=6,
+        moe_intermediate_size=3072,
+        expert_formats=("ds_fp4",),
+        embed_indexing=False,
+        aliases=("deepseek-ai/DeepSeek-V4-Pro-0813",),
+    ),
+    AotModel(
+        name="deepseek-ai/DeepSeek-V4.1-Flash",
+        architecture="DeepseekV41ForCausalLM",
+        hidden_size=5120,
+        kv_groups=(),
+        top_k=6,
+        moe_intermediate_size=2304,
+        expert_formats=("ds_fp4",),
     ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(

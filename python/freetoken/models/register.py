@@ -84,6 +84,8 @@ _MINIMAX_M3_PACKED = _DENSE_PACKED + (
 ) + _EXPERTS_W123_PACKED
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_DEEPSEEK_V41_PROCESSOR = "freetoken.mm.processors.deepseek_v41:DeepseekV41MMProcessor"
+_DEEPSEEK_V41_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "LlamaForCausalLM": ModelSpec(
@@ -155,6 +157,32 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_EXPERTS_W123_PACKED,
         # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
         unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
+    ),
+    "DeepseekV41ForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v41",
+        "DeepseekV41ForCausalLM",
+        # The official checkpoint stores the language model at the root and keeps the
+        # vision tower / aligner beside it.
+        checkpoint_roots=(
+            ("model.layers", "layers"),
+            ("model.embed", "embed"),
+            ("model.norm", "norm"),
+            ("head", "head"),
+            ("vision", "vision"),
+            ("aligner", "aligner"),
+        ),
+        packed_modules_mapping=_EXPERTS_W123_PACKED,
+        unquantized_modules=(
+            "head",
+            "vision.*",
+            "aligner.*",
+            "*.compressor.wkv",
+            "*.compressor.wgate",
+            "*.indexer.weights_proj",
+            "*.indexer.wk",
+        ),
+        mm_processor=_DEEPSEEK_V41_PROCESSOR,
+        encoders=_DEEPSEEK_V41_ENCODERS,
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",

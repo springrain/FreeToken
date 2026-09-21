@@ -148,6 +148,12 @@ class GraphRunner:
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
+        logger.debug(
+            "[STARTUP] graph.capture.init max_seq_len=%d graph_bs=%s vocab=%d",
+            max_seq_len,
+            self.graph_bs_list,
+            vocab_size,
+        )
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
 
         torch.cuda.synchronize(self.device)
@@ -171,6 +177,7 @@ class GraphRunner:
         )
         pool = None
         for bs in pbar:
+            logger.debug("[STARTUP] graph.capture.begin bs=%d", bs)
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
@@ -196,6 +203,7 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+            logger.debug("[STARTUP] graph.capture.done bs=%d", bs)
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)

@@ -69,20 +69,28 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
     """Fail before model/bank allocation unless the initial owner topology is explicit."""
     if config.moe_ep_size == 1:
         return
-    if config.moe_ep_size != config.tp_info.size or config.tp_info.size != 2:
+    if config.moe_ep_size != config.tp_info.size:
         raise ValueError(
-            "owner EP currently requires the initial same-group TP2+EP2 topology "
-            "(--tensor-parallel-size 2 --moe-ep-size 2)"
+            "owner EP requires a same-group topology: --moe-ep-size must equal "
+            "--tensor-parallel-size"
         )
-    if config.moe_strategy != "offload":
-        raise ValueError("owner EP currently requires --moe-strategy offload")
+    if config.tp_info.size < 2:
+        raise ValueError("owner EP requires a multi-rank TP+EP group")
+    if config.moe_strategy not in ("auto", "offload"):
+        raise ValueError(
+            "owner EP requires --moe-strategy offload (or auto, which resolves to offload)"
+        )
     if config.moe_cache_rate is not None:
         raise ValueError(
             "owner EP sizes a LOCAL pool, so --moe-cache-rate (a fraction of the GLOBAL "
             "expert count) has no owner-local meaning; use --moe-cache-size, or "
             "--moe-cache-auto to fill whatever the KV pool leaves"
         )
-    if config.moe_cache_size <= 0 and not config.moe_cache_auto:
+    if (
+        config.moe_strategy != "auto"
+        and config.moe_cache_size <= 0
+        and not config.moe_cache_auto
+    ):
         raise ValueError(
             "owner EP needs an explicit --moe-cache-size, or --moe-cache-auto (which now "
             "solves against the owner-local expert geometry)"
@@ -100,6 +108,18 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
             "owner EP is not supported for FTW checkpoints: load_ftw_banks rebuilds "
             "[num_experts, ...] GLOBAL expert rows with no ownership filter, so the banks "
             "cannot bind to the owner-local geometry"
+        )
+    model_config = config.model_config
+    formats = tuple(getattr(model_config, "owner_ep_expert_quants", ()))
+    if model_config.expert_quant not in formats:
+        raise NotImplementedError(
+            f"{model_config.model_type} does not implement owner EP for expert format "
+            f"{model_config.expert_quant!r}; supported formats: {formats or 'none'}"
+        )
+    if model_config.num_experts % config.moe_ep_size:
+        raise ValueError(
+            f"owner EP needs num_experts divisible by group size, got "
+            f"{model_config.num_experts} % {config.moe_ep_size}"
         )
     # CUDA graphs are allowed: decode admission goes through the fixed-shape, sync-free
     # OwnerOffloadMoeCache.ensure_route_graph when graphs are on (see _owner_graph_safe).
@@ -119,6 +139,27 @@ def _owner_graph_safe(config: EngineConfig) -> bool:
     if forced in ("1", "true", "yes", "on"):
         return True
     return bool(config.cuda_graph_max_bs)
+
+
+def _resolve_owner_ep_defaults(config: EngineConfig) -> None:
+    """Resolve owner EP's default backend before the validator runs.
+
+    Owner-local expert banks currently have only the GPU offload path. Keep the
+    ordinary ``auto`` CLI default usable and let the normal offload sizing code
+    solve the local cache capacity.
+    """
+    if not _owner_ep_enabled(config) or config.moe_strategy != "auto":
+        return
+    object.__setattr__(config, "moe_strategy", "offload")
+    if (
+        config.moe_cache_size <= 0
+        and config.moe_cache_rate is None
+        and not config.moe_cache_auto
+    ):
+        object.__setattr__(config, "moe_cache_auto", True)
+    logger.info_rank0(
+        "Owner EP resolves --moe-strategy auto to offload with owner-local cache sizing"
+    )
 
 
 def _flashinfer_available() -> bool:
@@ -398,6 +439,21 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        logger.debug(
+            "[STARTUP] engine.init.begin model=%s model_type=%s tp=%s/%s moe_ep=%s "
+            "moe_strategy=%s attention_backend=%s max_seq=%s max_batch=%s graph_max_bs=%s",
+            config.model_path,
+            config.model_config.model_type,
+            config.tp_info.rank,
+            config.tp_info.size,
+            config.moe_ep_size,
+            config.moe_strategy,
+            config.attention_backend,
+            config.max_seq_len,
+            config.max_running_req,
+            config.cuda_graph_max_bs,
+        )
+        _resolve_owner_ep_defaults(config)
         _validate_owner_ep_config(config)
         current_tp = try_get_tp_info()
         if current_tp is None:
@@ -426,6 +482,7 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
+        logger.debug("[STARTUP] engine.communication.ready")
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
@@ -435,7 +492,16 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        logger.debug(
+            "[STARTUP] engine.model.created class=%s layers=%s hidden=%s vocab=%s",
+            type(self.model).__name__,
+            config.model_config.num_layers,
+            config.model_config.hidden_size,
+            config.model_config.vocab_size,
+        )
+        logger.debug("[STARTUP] engine.weights.begin")
         self._load_weights(config)
+        logger.debug("[STARTUP] engine.weights.done")
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -464,9 +530,13 @@ class Engine:
             with _weight_load_context():
                 self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
+            logger.debug("[STARTUP] engine.expert_cache.begin")
             self._init_offload_moe_cache(config)
+            logger.debug("[STARTUP] engine.expert_cache.done")
         if hasattr(self.model, "prepare_for_runtime"):
+            logger.debug("[STARTUP] engine.prepare_runtime.begin")
             self.model.prepare_for_runtime()
+            logger.debug("[STARTUP] engine.prepare_runtime.done")
         self.encoder_cache = None
         self.mm_processor = None
         if config.active_encoders:
@@ -536,6 +606,10 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        logger.debug(
+            "[STARTUP] engine.attention_backend.ready class=%s",
+            type(self.attn_backend).__name__,
+        )
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -557,6 +631,13 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        logger.debug(
+            "[STARTUP] graph_runner.construct.begin max_seq_len=%s aligned_max_seq_len=%s "
+            "cuda_graph_max_bs=%s",
+            config.max_seq_len,
+            aligned_max_seq_len,
+            config.cuda_graph_max_bs,
+        )
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -571,6 +652,10 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
+        logger.debug(
+            "[STARTUP] graph_runner.construct.done graph_bs=%s",
+            self.graph_runner.graph_bs_list,
+        )
         # NOTE: ``--moe-collect-decode-freq`` is CUDA-graph safe. The histogram lives on the
         # device (``OffloadMoeCache.decode_freq``) and is accumulated by a device-side
         # ``scatter_add_`` at the raw-ids point, so a captured decode graph replays the
@@ -578,9 +663,18 @@ class Engine:
         # for it.
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
+            logger.debug("[STARTUP] prefill_warmup.begin")
             self._warmup_prefill()
+            logger.debug("[STARTUP] prefill_warmup.done")
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        logger.debug(
+            "[STARTUP] engine.communication.begin backend=%s rank=%s/%s use_pynccl=%s",
+            "gloo" if config.tp_info.size == 1 or config.use_pynccl else "nccl",
+            config.tp_info.rank,
+            config.tp_info.size,
+            config.use_pynccl,
+        )
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -605,9 +699,15 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+        logger.debug("[STARTUP] engine.communication.process_group.ready")
         return tp_cpu_group
 
     def _load_weights(self, config: EngineConfig) -> None:
+        logger.debug(
+            "[STARTUP] engine.load_weights.begin dummy=%s active_encoders=%s",
+            config.use_dummy_weight,
+            bool(config.active_encoders),
+        )
         if config.active_encoders and not config.use_dummy_weight and ftw_lacks_vision(config.model_path):
             raise ValueError(
                 f"{config.model_path} holds no vision encoder tensors: it was converted by a build before this "
@@ -616,7 +716,9 @@ class Engine:
             )
         with _weight_load_context():
             self.model.load_state_dict(self._load_weight_state_dict(config))
+        logger.debug("[STARTUP] engine.load_weights.state_dict.ready")
         finalize_quant(self.model)
+        logger.debug("[STARTUP] engine.load_weights.quant.finalized")
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -680,12 +782,11 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
 
-        ``ownership`` switches the expert geometry to the OWNER-LOCAL namespace: under EP2 a
+        ``ownership`` switches the expert geometry to the OWNER-LOCAL namespace: under EP a
         rank's pool only ever holds its own rows, so the floor/cap and the coverage the plan
         is solved against are ``local_num_experts`` and ``num_layers * local_num_experts``.
-        Solving against the global counts would under-fill (the cap ``total_experts`` is 2x
-        too large and the floor is wrong), which is why owner EP used to demand an explicit
-        ``--moe-cache-size``.
+        Solving against the global counts would under-fill because the cap and floor use the
+        wrong namespace, which is why owner EP used to demand an explicit cache size.
 
         A fixed KV pool (``--num-tokens``) is reserved EXACTLY, not at the
         ``--kv-reserve-tokens`` floor: the caller has already pinned the KV geometry, so
@@ -728,10 +829,15 @@ class Engine:
         ownership = None
         owner_geometry = None
         if owner_ep:
-            if config.model_config.model_type != "qwen4_exp":
-                raise NotImplementedError("owner EP is currently implemented only for Qwen4Exp")
-            if config.model_config.expert_quant != "nvfp4":
-                raise NotImplementedError("owner EP currently requires native NVFP4 expert banks")
+            formats = tuple(
+                getattr(config.model_config, "owner_ep_expert_quants", ())
+            )
+            if config.model_config.expert_quant not in formats:
+                raise NotImplementedError(
+                    f"{config.model_config.model_type} does not implement owner EP for "
+                    f"expert format {config.model_config.expert_quant!r}; supported "
+                    f"formats: {formats or 'none'}"
+                )
             ownership = ExpertOwnership(
                 global_num_experts=config.model_config.num_experts,
                 world_size=config.moe_ep_size,
@@ -795,6 +901,15 @@ class Engine:
             ]
         try:
             with _weight_load_context():
+                logger.debug(
+                    "[STARTUP] engine.expert_banks.load.begin method=%s layers=%s experts=%s "
+                    "cache_size=%s ownership=%s",
+                    type(method).__name__ if method is not None else None,
+                    config.model_config.num_moe_layers,
+                    config.model_config.num_experts,
+                    config.moe_cache_size,
+                    ownership is not None,
+                )
                 banks = load_expert_banks(
                     config.model_path,
                     config.model_config,
@@ -806,6 +921,12 @@ class Engine:
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
                     ownership=ownership,
+                )
+                logger.debug(
+                    "[STARTUP] engine.expert_banks.load.done format=%s kind=%s kernel=%s",
+                    banks.quant_format,
+                    banks.kind,
+                    banks.kernel,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -1201,6 +1322,13 @@ class Engine:
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
+        logger.debug(
+            "[STARTUP] graph_runner.construct.begin max_seq_len=%s aligned_max_seq_len=%s "
+            "cuda_graph_max_bs=%s",
+            config.max_seq_len,
+            aligned_max_seq_len,
+            config.cuda_graph_max_bs,
+        )
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -1221,8 +1349,24 @@ class Engine:
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        logger.debug(
+            "[FORWARD] begin model=%s phase=%s size=%d padded=%d graph=%s input_tokens=%d",
+            type(self.model).__name__,
+            batch.phase,
+            batch.size,
+            batch.padded_size,
+            use_graph,
+            int(batch.input_ids.numel()) if batch.input_ids is not None else -1,
+        )
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        logger.debug(
+            "[FORWARD] model.done model=%s phase=%s size=%d logits_shape=%s",
+            type(self.model).__name__,
+            batch.phase,
+            batch.size,
+            tuple(logits.shape),
+        )
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1232,7 +1376,16 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
+        logger.debug(
+            "[SAMPLER] begin phase=%s logits_shape=%s temperatures=%s top_k=%s top_p=%s",
+            batch.phase,
+            tuple(batch_logits.shape),
+            args.temperatures is not None,
+            args.top_k is not None,
+            args.top_p is not None,
+        )
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        logger.debug("[SAMPLER] done phase=%s size=%d", batch.phase, batch.size)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

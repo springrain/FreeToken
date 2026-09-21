@@ -33,7 +33,7 @@ FP8 = torch.float8_e4m3fn
 # fp8-MMA vs bf16-MMA GEMMs: identical grid values, but the MMA-internal fp32
 # reduction order may differ (dsv4_gemm / moe_prefill_fp8 happen to be bit-exact
 # on H100 -- that is lowering luck, not a guarantee).
-_MMA_TOL_KEYS = {"blk_gemm", "dsv4_gemm", "moe_prefill_fp8"}
+_MMA_TOL_KEYS = {"blk_gemm", "dsv4_gemm", "dsv41_gemm_32", "moe_prefill_fp8"}
 _MMA_TOL = dict(rtol=5e-2, atol=0.5)
 
 
@@ -120,7 +120,9 @@ def _emit_all(path: str) -> None:
     from freetoken.kernel.triton.e4m3_compat import e4m3_native
     from freetoken.kernel.triton.dsv4.fp8_linear import (
         act_quant_fp8, act_quant_fp8_inplace, act_quant_fp8_roundtrip,
-        block_fp8_linear as dsv4_block_fp8_linear, fp4_act_quant_inplace,
+        block_fp8_linear as dsv4_block_fp8_linear,
+        fp4_act_quant_e4m3_inplace,
+        fp4_act_quant_inplace,
     )
     from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
     from freetoken.kernel.triton.fp8_block_linear import (
@@ -153,12 +155,35 @@ def _emit_all(path: str) -> None:
     out["dsv4_inplace"] = act_quant_fp8_inplace(xi.clone()[:, :512], 64).cpu()
     out["dsv4_fp4"] = fp4_act_quant_inplace(
         torch.randn(32, 128, dtype=torch.bfloat16, device=dev), 32).cpu()
+    fp4_e4 = torch.randn(32, 128, dtype=torch.bfloat16, device=dev)
+    out["dsv41_fp4_e4m3_b16"] = fp4_act_quant_e4m3_inplace(
+        fp4_e4.clone(), 16
+    ).cpu()
+    out["dsv41_fp4_e4m3_b32"] = fp4_act_quant_e4m3_inplace(
+        fp4_e4.clone(), 32
+    ).cpu()
     wq = torch.randn(1024, 4096, device=dev).to(FP8)
     sq = torch.full((8, 32), 129, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
     out["dsv4_gemv"] = f32(dsv4_block_fp8_linear(
         torch.randn(1, 4096, dtype=torch.bfloat16, device=dev), wq, sq))
     out["dsv4_gemm"] = f32(dsv4_block_fp8_linear(
         torch.randn(64, 4096, dtype=torch.bfloat16, device=dev), wq, sq))
+    wq32 = torch.randn(256, 512, device=dev).to(FP8)
+    sq32 = torch.full(
+        (8, 16), 129, dtype=torch.uint8, device=dev
+    ).view(torch.float8_e8m0fnu)
+    out["dsv41_gemv_32"] = f32(dsv4_block_fp8_linear(
+        torch.randn(1, 512, dtype=torch.bfloat16, device=dev),
+        wq32,
+        sq32,
+        block_size=32,
+    ))
+    out["dsv41_gemm_32"] = f32(dsv4_block_fp8_linear(
+        torch.randn(64, 512, dtype=torch.bfloat16, device=dev),
+        wq32,
+        sq32,
+        block_size=32,
+    ))
 
     # per-tensor fp8 dense
     w = torch.randn(256, 512, device=dev).to(FP8)

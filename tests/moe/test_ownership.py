@@ -13,8 +13,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
-
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     iter_nvfp4_expert_pieces,
@@ -24,7 +22,7 @@ from freetoken.moe.ownership import (
     OwnerCacheAdapter,
     OwnerCacheGeometry,
 )
-
+from safetensors.torch import save_file
 
 _GENERIC_RE = re.compile(
     r"^layer\.(?P<layer>\d+)\.expert\.(?P<expert>\d+)\."
@@ -38,21 +36,36 @@ _GENERIC_SPEC = Nvfp4ExpertSourceSpec(
 )
 
 
-def test_contiguous_ownership_covers_global_experts_once():
-    owners = [ExpertOwnership(8, 2, rank) for rank in range(2)]
-    assert [o.local_num_experts for o in owners] == [4, 4]
-    assert [o.global_start for o in owners] == [0, 4]
-    assert [o.global_end for o in owners] == [4, 8]
-    assert [owners[0].owner(i) for i in range(8)] == [0, 0, 0, 0, 1, 1, 1, 1]
+@pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 8, 10, 12])
+def test_contiguous_ownership_covers_global_experts_once(world_size):
+    global_num_experts = 120
+    local_num_experts = global_num_experts // world_size
+    owners = [
+        ExpertOwnership(global_num_experts, world_size, rank)
+        for rank in range(world_size)
+    ]
+    assert [o.local_num_experts for o in owners] == [local_num_experts] * world_size
+    assert [o.global_start for o in owners] == [
+        rank * local_num_experts for rank in range(world_size)
+    ]
+    assert [o.global_end for o in owners] == [
+        (rank + 1) * local_num_experts for rank in range(world_size)
+    ]
+    assert [owners[0].owner(i) for i in range(global_num_experts)] == [
+        i // local_num_experts for i in range(global_num_experts)
+    ]
 
     for rank, owner in enumerate(owners):
-        local, mask = owner.global_to_local(torch.arange(8, dtype=torch.int32))
-        expected = list(range(4)) if rank == 0 else [-1] * 4 + list(range(4))
-        if rank == 0:
-            expected = list(range(4)) + [-1] * 4
+        local, mask = owner.global_to_local(
+            torch.arange(global_num_experts, dtype=torch.int32)
+        )
+        expected = [-1] * global_num_experts
+        expected[owner.global_start : owner.global_end] = range(local_num_experts)
         assert local.tolist() == expected
-        assert int(mask.sum()) == 4
-        assert owner.local_to_global(torch.arange(4, dtype=torch.int32)).tolist() == list(
+        assert int(mask.sum()) == local_num_experts
+        assert owner.local_to_global(
+            torch.arange(local_num_experts, dtype=torch.int32)
+        ).tolist() == list(
             range(owner.global_start, owner.global_end)
         )
 
@@ -72,26 +85,26 @@ def test_ownership_rejects_invalid_geometry_and_ids():
         owner.validate_global_ids(torch.tensor([0, 8]))
 
 
-@pytest.mark.parametrize(
-    "route_ids",
-    [
-        [0, 1, 2, 3, 4, 5, 6, 7, 0, 7],  # 5/5, including duplicates
-        [0] * 10,  # rank 0 owns all entries
-        [4] * 10,  # rank 1 owns all entries
-    ],
-)
-def test_partition_route_masks_remote_entries_without_local_renormalization(route_ids):
+@pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 8, 10, 12])
+def test_partition_route_masks_remote_entries_without_local_renormalization(world_size):
+    global_num_experts = 120
+    local_num_experts = global_num_experts // world_size
+    route_ids = list(range(global_num_experts)) + [0, global_num_experts - 1]
     ids = torch.tensor([route_ids], dtype=torch.int32)
-    weights = torch.arange(1, 11, dtype=torch.float32).reshape(1, 10) / 55
-    owners = [ExpertOwnership(8, 2, rank) for rank in range(2)]
+    weights = torch.arange(1, len(route_ids) + 1, dtype=torch.float32).reshape(1, -1)
+    weights = weights / weights.sum()
+    owners = [
+        ExpertOwnership(global_num_experts, world_size, rank)
+        for rank in range(world_size)
+    ]
     routes = [owner.partition_route(weights, ids) for owner in owners]
 
-    assert torch.equal(routes[0].weights + routes[1].weights, weights)
-    assert torch.equal(routes[0].owned_mask | routes[1].owned_mask, torch.ones_like(ids, dtype=torch.bool))
-    assert torch.equal(routes[0].owned_mask & routes[1].owned_mask, torch.zeros_like(ids, dtype=torch.bool))
+    assert torch.equal(torch.stack([route.weights for route in routes]).sum(0), weights)
+    ownership_count = torch.stack([route.owned_mask for route in routes]).sum(0)
+    assert torch.equal(ownership_count, torch.ones_like(ids))
     for route in routes:
         assert torch.all(route.local_ids >= 0)
-        assert torch.all(route.local_ids < 4)
+        assert torch.all(route.local_ids < local_num_experts)
         assert torch.equal(route.weights[~route.owned_mask], torch.zeros_like(route.weights[~route.owned_mask]))
 
 

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearOProj, LinearQKVMerged, LinearReplicated
 from freetoken.models.qwen4_exp.config import qwen4_exp_tp_geometry
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
@@ -127,13 +127,10 @@ class Qwen4ExpAttention(BaseOP):
         self.qo_attn_dim = geometry.q_attn_dim
         self.kv_attn_dim = geometry.kv_attn_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        # ``LinearColParallelMerged`` shards each segment by TP, so it is built from the
-        # GLOBAL sizes; the forward splits the rank-local output by ``self._qkv_split``.
-        self._qkv_global_split = [
-            2 * config.num_qo_heads * config.head_dim,
-            config.num_kv_heads * config.head_dim,
-            config.num_kv_heads * config.head_dim,
-        ]
+        # Q is split by gated heads (2 * head_dim rows per head), while K/V use the
+        # standard KV-head rule: shard when KV heads >= TP, otherwise replicate one
+        # complete head across consecutive rank groups. The model declaration must use
+        # the same geometry as the raw checkpoint sharder.
         # q|k|v are all quantized together (or all bf16), so the merged GEMM stays a
         # single kernel; a modelopt MIXED_PRECISION checkpoint declares them FP8_PB_WO.
         #
@@ -148,8 +145,13 @@ class Qwen4ExpAttention(BaseOP):
                 "qwen4_exp dense TP currently supports the BF16 attention path only"
             )
         quant = config.quant if config.attn_quant != "none" else None
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_global_split, has_bias=False,
+        self.qkv_proj = LinearQKVMerged(
+            config.hidden_size,
+            self.head_dim,
+            config.num_qo_heads,
+            config.num_kv_heads,
+            has_bias=False,
+            q_head_dim=2 * self.head_dim,
             quant_config=quant, prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = LinearOProj(

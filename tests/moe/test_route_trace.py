@@ -1,14 +1,16 @@
-"""Tests for moe/route_trace.py: capture round-trip, LRU-mirror semantics, EP2 slow-side.
+"""Tests for moe/route_trace.py: capture round-trip, LRU-mirror semantics, EP slow-side.
 
 Pure CPU, no torch/CUDA needed for the replay/LRU parts (the recorder's ``record``
 takes a tensor, so it uses a tiny stub). Mirrors PLAN_TP_EP.md 6A's requirement that
-the replay match flashlib lru_ensure semantics before it is trusted for the EP2 call.
+the replay match flashlib lru_ensure semantics before it is trusted for EP analysis.
 """
 from __future__ import annotations
 
 import importlib.util
 import sys
 from pathlib import Path
+
+import pytest
 
 # Load route_trace.py directly by path: it is stdlib-only, so importing it without
 # the freetoken.moe package __init__ (which pulls torch/transformers) keeps these
@@ -23,6 +25,7 @@ LRU = _rt.LRU
 RouteTraceRecorder = _rt.RouteTraceRecorder
 read_trace = _rt.read_trace
 replay = _rt.replay
+replay_ep = _rt.replay_ep
 replay_ep2 = _rt.replay_ep2
 
 
@@ -94,43 +97,54 @@ def test_lru_dedup():
     assert c.miss == 2 and c.active == 2
 
 
-def test_replay_tp1_vs_ep2(tmp_path):
-    import struct
-
-    path = str(tmp_path / "r.bin")
-    rec = RouteTraceRecorder(
-        path, num_experts=512, num_layers=2, cache_size=100, top_k=8, model="t",
-        decode_target="gpu",
-    )
-
-    def put(layer, ids):
-        rec._buf += struct.Struct("<bii").pack(0, layer, len(ids))
-        rec._buf += struct.pack(f"<{len(ids)}i", *ids)
-        rec._n += 1
-
-    # Genuine cache pressure: each step touches 8 distinct experts drawn uniformly
-    # from a 120-wide window that straddles BOTH halves (0-59 in rank0's [0,256),
-    # 256-315 in rank1's). Working set (120) >> pool (40), so TP1 thrashes; under
-    # EP2 each rank only caches its own 60, and a 40-slot pool covers 40/60 of it
-    # vs 40/120 for TP1 -> strictly fewer misses on the slow rank.
+@pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 8, 10, 12])
+def test_replay_tp1_vs_ep(world_size):
+    # Each rank repeatedly touches two experts from a six-wide owner-local window
+    # on two layers. A 12-slot local cache covers that rank's full working set,
+    # while TP1 sees the combined 12*world_size rows with the same capacity.
     import random
-    rng = random.Random(0)
-    window = list(range(60)) + list(range(256, 316))
-    for _ in range(400):
-        put(0, rng.sample(window, 8))
-        put(1, rng.sample(window, 8))
-    rec.close()
 
-    meta, records = read_trace(path)
-    _, _, tp1 = replay(records, 40, 512)
-    ep = replay_ep2(records, (40, 40), 512)
-    assert ep["slow_rate"] < tp1, f"EP2 slow {ep['slow_rate']} should beat TP1 {tp1}"
-    # symmetric window -> roughly balanced load per rank (random draw, not exact)
-    a0, a1 = ep["rank_active"]
-    assert abs(a0 - a1) <= 0.1 * max(a0, a1), (a0, a1)
+    rng = random.Random(0)
+    num_experts = 120
+    local_num_experts = num_experts // world_size
+    records = []
+    for _ in range(400):
+        ids = []
+        for rank in range(world_size):
+            lo = rank * local_num_experts
+            ids.extend(lo + e for e in rng.sample(range(6), 2))
+        for layer in range(2):
+            records.append((0, layer, tuple(ids)))
+
+    _, _, tp1 = replay(records, 12, num_experts)
+    ep = replay_ep(records, (12,) * world_size, num_experts)
+    assert ep["slow_rate"] < tp1, (
+        f"EP{world_size} slow {ep['slow_rate']} should beat TP1 {tp1}"
+    )
+    assert len(ep["rank_miss"]) == len(ep["rank_active"]) == world_size
+    assert len(set(ep["rank_active"])) == 1
     # slow-side miss >= each rank's miss (it is the per-step max), so it is the limiter
     assert ep["slow_miss"] >= max(ep["rank_miss"])
     assert tp1 > 0.3, f"expected real cache pressure, TP1 miss={tp1}"
+
+
+def test_replay_ep2_is_a_compatibility_wrapper():
+    records = [(0, 0, (0, 4, 1, 5)), (0, 0, (2, 6, 3, 7))]
+    assert replay_ep2(records, (2, 2), 8) == replay_ep(records, (2, 2), 8)
+
+
+@pytest.mark.parametrize(
+    ("cache_sizes", "num_experts", "message"),
+    [
+        ((), 8, "at least 2 ranks"),
+        ((4,), 8, "at least 2 ranks"),
+        ((4, 4, 4), 10, "not divisible"),
+        ((4,) * 6, 32, "not divisible"),
+    ],
+)
+def test_replay_ep_rejects_invalid_geometry(cache_sizes, num_experts, message):
+    with pytest.raises(ValueError, match=message):
+        replay_ep([], cache_sizes, num_experts)
 
 
 def test_overflow_flag(tmp_path):

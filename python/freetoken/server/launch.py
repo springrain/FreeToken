@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING
 from freetoken.distributed import DistributedInfo
 from freetoken.utils import init_logger
 
+
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     from .args import ServerArgs
     from .supervisor import BackendHandle
@@ -56,6 +59,16 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
+    # Resolve the same per-rank target used below for CUDA binding. With no --gpu argument,
+    # the fallback must still contain one ordinal per TP rank.
+    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
+    logger.debug(
+        "[STARTUP] scheduler.begin rank=%d/%d model=%s gpu=%s",
+        args.tp_info.rank,
+        args.tp_info.size,
+        args.model_path,
+        targets[args.tp_info.rank],
+    )
     if args.shell_mode:
         _detach_process_group()
 
@@ -63,11 +76,12 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     from freetoken.gpu_select import set_assigned_gpu
 
     # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
-    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
     set_assigned_gpu(targets[args.tp_info.rank])
 
+    logger.debug("[STARTUP] scheduler.torch_import.begin rank=%d", args.tp_info.rank)
     import torch
     from freetoken.scheduler import Scheduler
+    logger.debug("[STARTUP] scheduler.torch_import.done rank=%d", args.tp_info.rank)
 
     if args.tp_info.is_primary():
         from freetoken.utils.progress import set_progress_sink
@@ -78,8 +92,12 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
     with torch.inference_mode():
         try:
+            logger.debug("[STARTUP] scheduler.construct.begin rank=%d", args.tp_info.rank)
             scheduler = Scheduler(args)
+            logger.debug("[STARTUP] scheduler.construct.done rank=%d", args.tp_info.rank)
+            logger.debug("[STARTUP] scheduler.sync.begin rank=%d", args.tp_info.rank)
             scheduler.sync_all_ranks()
+            logger.debug("[STARTUP] scheduler.sync.done rank=%d", args.tp_info.rank)
         except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
             # A startup failure (bad config, OOM, corrupt weights) would otherwise reach the
             # parent only as a dead process -> a generic "exited during load". Push the real
@@ -104,6 +122,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
             ack_queue.put("Scheduler is ready")
+            logger.debug("[STARTUP] scheduler.ready rank=%d", args.tp_info.rank)
             # The supervisor stops draining ack_queue once ready, so uninstall the sink:
             # runtime cache rebuilds re-run the graph capture (which emits progress) and
             # would otherwise push onto a queue nobody reads for the server's lifetime.
@@ -115,10 +134,10 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         try:
             scheduler.run_forever()
         except KeyboardInterrupt:
-            logger = init_logger(__name__)
+            scheduler_logger = init_logger(__name__)
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C
-                logger.info("Scheduler exiting gracefully...")
+                scheduler_logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
 
 

@@ -2,7 +2,7 @@
 ## docker build -t fedimoss/ft:v0.1.3 .
 
 # Devel base: building csrc needs g++/nvcc, and runtime kernel JIT needs nvcc on PATH.
-FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.4.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
@@ -49,6 +49,8 @@ RUN sed -i 's|https://download.pytorch.org/whl/cu130|https://mirror.sjtu.edu.cn/
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd /opt/FreeToken \
     && uv pip install --system --break-system-packages ".[accel]" \
+    ## https://github.com/NVIDIA/nccl/issues/2353   多卡卡死!!!
+    && uv pip install --system --break-system-packages nvidia-nccl-cu13==2.31.2 --no-deps \
     && cd / \
     && rm -rf /opt/FreeToken
 

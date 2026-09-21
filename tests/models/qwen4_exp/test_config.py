@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from freetoken.attention import AttnType
 from freetoken.models.config import (
@@ -146,6 +147,75 @@ def test_tp2_geometry_is_local_but_model_config_stays_global():
     assert local.local_conv_dim == local.conv_dim
     assert local.local_recurrent_state_shape == (24, 128, 128)
     assert cfg.num_qo_heads == 24 and cfg.num_kv_heads == 2
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_qsa_gated_qkv_decl_matches_loader_head_partition(monkeypatch, tp_size):
+    from freetoken.distributed import info
+    from freetoken.models.qwen4_exp import attention as attention_mod
+    from freetoken.models.qwen4_exp.attention import Qwen4ExpAttention
+    from freetoken.models.qwen4_exp.weight import shard_qwen4_exp_dense_tensor
+
+    cfg = parse_config(_hf_config())
+    hd = cfg.head_dim
+    q = torch.arange(cfg.num_qo_heads).repeat_interleave(2 * hd).view(-1, 1)
+    k = torch.arange(cfg.num_kv_heads).repeat_interleave(hd).view(-1, 1)
+    v = (100 + torch.arange(cfg.num_kv_heads)).repeat_interleave(hd).view(-1, 1)
+    q_shards = []
+
+    monkeypatch.setattr(attention_mod, "get_rope", lambda **_kwargs: object())
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            info, "_TP_INFO", info.DistributedInfo(rank=rank, size=tp_size)
+        )
+        with torch.device("meta"):
+            layer = Qwen4ExpAttention(cfg, layer_id=3)
+
+        parts = [
+            shard_qwen4_exp_dense_tensor(
+                f"layers.3.self_attn.{proj}_proj.weight",
+                tensor,
+                config=cfg,
+                rank=rank,
+                world_size=tp_size,
+            )
+            for proj, tensor in (("q", q), ("k", k), ("v", v))
+        ]
+        q_shards.append(parts[0])
+        assert tuple(layer.qkv_proj.output_sizes) == tuple(part.shape[0] for part in parts)
+        assert layer.qkv_proj.weight.shape[0] == sum(part.shape[0] for part in parts)
+        assert layer.qkv_proj.weight.shape[1] == cfg.hidden_size
+
+        if tp_size <= cfg.num_kv_heads:
+            first_kv_head = rank * (cfg.num_kv_heads // tp_size)
+        else:
+            first_kv_head = rank // (tp_size // cfg.num_kv_heads)
+        assert torch.unique(parts[1]).tolist() == [first_kv_head]
+        assert torch.unique(parts[2]).tolist() == [100 + first_kv_head]
+
+    assert torch.equal(torch.cat(q_shards), q)
+
+
+@pytest.mark.parametrize("tp_size", [3, 6, 9])
+def test_gated_qkv_parallelism_depends_on_head_geometry(monkeypatch, tp_size):
+    from freetoken.distributed import info
+    from freetoken.layers import LinearQKVMerged
+
+    monkeypatch.setattr(
+        info, "_TP_INFO", info.DistributedInfo(rank=tp_size - 1, size=tp_size)
+    )
+    with torch.device("meta"):
+        layer = LinearQKVMerged(
+            hidden_size=96,
+            head_dim=16,
+            q_head_dim=32,
+            num_qo_heads=18,
+            num_kv_heads=3,
+            has_bias=False,
+        )
+
+    assert layer.output_sizes == (18 * 32 // tp_size, 16, 16)
+    assert layer.weight.shape == (sum(layer.output_sizes), 96)
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])

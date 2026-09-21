@@ -5,7 +5,17 @@ from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
+VISION_KEY_PREFIXES = (
+    "vision_tower.",
+    "embed_vision.",
+    "vision_embedder.",
+    "visual.",
+    "vision.",
+    "aligner.",
+    "image_start",
+    "image_end",
+    "image_newline",
+)
 
 
 def detect_expert_quant(hf_config: Any) -> str:
@@ -280,6 +290,10 @@ class ModelConfig:
     # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +
     # weight_scale_inv per block), also applied to the dense projections.
     expert_quant: str = "none"
+    # Expert formats for which this model implements owner-local EP. An empty tuple
+    # keeps owner EP disabled; model adapters opt in explicitly after their loader,
+    # MoE reduction and expert-kernel geometry all support it.
+    owner_ep_expert_quants: Tuple[str, ...] = ()
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
     weight_block_size: tuple[int, int] | None = None
     # the checkpoint's quant kind for the dense attention / GatedDeltaNet projections, detected by the family's parse_config for its reader

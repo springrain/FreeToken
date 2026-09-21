@@ -3,14 +3,22 @@ experts (GPU slot-cache / cpu / hybrid decode paths)."""
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import torch.nn.functional as F
 
+from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
 
 from .args import DeepseekV4Args
+
+from freetoken.utils import init_logger
+
+
+logger = init_logger(__name__)
 
 
 class Gate(BaseOP):
@@ -59,9 +67,9 @@ class Expert(BaseOP):
         self.w3 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
         self.swiglu_limit = swiglu_limit
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
         h = fused_swiglu(self.w1.forward(x), self.w3.forward(x), self.swiglu_limit, x.dtype)
-        return self.w2.forward(h)
+        return self.w2.forward(h, reduce=reduce)
 
 
 class DSV4OffloadMoELayer(OffloadMoELayer):
@@ -70,7 +78,17 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     below the route crossover) and slot-cache / cpu / hybrid decode paths
     (per-route dequant GEMV)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        expert_tp_size: int | None = None,
+        quant_config=None,
+        prefix: str = "",
+    ):
         super().__init__(
             layer_id=layer_id,
             num_experts=args.n_routed_experts,
@@ -82,9 +100,43 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             limit=args.swiglu_limit,
             strategy=strategy,
             decode_target=decode_target,
+            expert_tp_size=expert_tp_size,
             quant_config=quant_config,
             prefix=prefix,
         )
+
+    def routed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        reduce: bool = True,
+    ) -> torch.Tensor:
+        phase = "unknown"
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                phase = "prefill" if get_global_ctx().batch.is_prefill else "decode"
+            except AssertionError:
+                pass
+        logger.debug(
+            "[DSV4_TRACE] routed_experts.begin layer=%d tokens=%d routes=%s phase=%s "
+            "owner=%s reduce=%s",
+            self.layer_id,
+            hidden_states.shape[0],
+            tuple(topk_ids.shape),
+            phase,
+            self.owner_cache is not None,
+            reduce,
+        )
+        out = super().routed_forward(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            reduce=reduce,
+        )
+        logger.debug("[DSV4_TRACE] routed_experts.done layer=%d", self.layer_id)
+        return out
 
     def _prefill_routed(
         self,
@@ -130,23 +182,77 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
 class MoE(BaseOP):
     """Sparse MoE: hash/score router -> offloaded MXFP4 routed experts + shared expert."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        expert_tp_size: int | None = None,
+        quant_config=None,
+        prefix: str = "",
+    ):
         self.dim = args.dim
         self.gate = Gate(layer_id, args)
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit, quant_config=quant_config, prefix=f"{prefix}.shared_experts")
-        self.experts = DSV4OffloadMoELayer(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.experts")
+        self.experts = DSV4OffloadMoELayer(
+            layer_id,
+            args,
+            strategy=strategy,
+            decode_target=decode_target,
+            expert_tp_size=expert_tp_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+        )
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
+        phase = "unknown"
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                phase = "prefill" if get_global_ctx().batch.is_prefill else "decode"
+            except AssertionError:
+                # Standalone model tests can call the MoE without an engine context.
+                pass
+        logger.debug(
+            "[DSV4_TRACE] moe.begin layer=%d tokens=%d phase=%s owner_ep=%s",
+            self.experts.layer_id,
+            x.size(0),
+            phase,
+            self.experts.owner_cache is not None,
+        )
         weights, indices = self.gate.forward(x, input_ids.flatten())
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DSV4_TRACE] moe.route layer=%d weights=%s ids=%s device=%s",
+                self.experts.layer_id,
+                tuple(weights.shape),
+                tuple(indices.shape),
+                indices.device,
+            )
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
-        shared = self.shared_experts.forward(x)
+        owner_ep = self.experts.owner_cache is not None
+        logger.debug("[DSV4_TRACE] moe.shared.begin layer=%d reduce=%s", self.experts.layer_id, not owner_ep)
+        shared = self.shared_experts.forward(x, reduce=not owner_ep)
+        logger.debug("[DSV4_TRACE] moe.shared.done layer=%d", self.experts.layer_id)
         # routed_forward may mutate the ids in place (offload decode slot remap);
         # indices.to(int32) always copies (int64 source), so no clone needed here.
         routed = self.experts.routed_forward(
-            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+            x,
+            weights.float().contiguous(),
+            indices.to(torch.int32).contiguous(),
+            reduce=not owner_ep,
         )
-        return (routed + shared).view(shape)
+        logger.debug("[DSV4_TRACE] moe.routed.done layer=%d", self.experts.layer_id)
+        if owner_ep:
+            logger.debug("[DSV4_TRACE] moe.reduce.begin layer=%d", self.experts.layer_id)
+            routed = self.experts._maybe_all_reduce(routed + shared)
+            logger.debug("[DSV4_TRACE] moe.reduce.done layer=%d", self.experts.layer_id)
+            return routed.view(shape)
+        out = (routed + shared).view(shape)
+        logger.debug("[DSV4_TRACE] moe.done layer=%d", self.experts.layer_id)
+        return out

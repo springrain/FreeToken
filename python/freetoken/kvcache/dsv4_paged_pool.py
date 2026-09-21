@@ -201,6 +201,16 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self.full_to_window = torch.full(
             (sizes.full_token + 1,), -1, dtype=torch.int64, device=device
         )
+        self.token_cache = (
+            torch.full(
+                (sizes.full_token + 1,),
+                int(getattr(self.args, "engram_pad_id", 0)),
+                dtype=torch.int32,
+                device=device,
+            )
+            if getattr(self.args, "engram_layer_ids", ())
+            else None
+        )
 
         # The ONE slot map (table_idx, pos) -> full loc: the shared page_table, attached by the
         # engine policy. Window slots come from ``full_to_window``; cmp/idx rows are arithmetic.
@@ -223,7 +233,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self.indexer_state_ring: list[CompressStateRing | None] = []
         for L in range(self._n_layers):
             ratio = self.compress_ratios[L]
-            if ratio == 0:
+            if sizes.cmp_blocks[L] is None:
                 self.cmp_pool.append(None)
                 self.idx_pool.append(None)
                 self.state_ring.append(None)
@@ -238,7 +248,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
                     sizes.cmp_blocks[L] + self.n_scratch, self.head_dim, device=device, dtype=dtype
                 )
             )
-            if ratio == 4:
+            if sizes.idx_blocks[L] is not None:
                 self.idx_scratch_base.append(sizes.idx_blocks[L])
                 self.idx_pool.append(
                     torch.zeros(
@@ -248,30 +258,35 @@ class DSV4PagedKVCache(BaseKVCachePool):
                         dtype=dtype,
                     )
                 )
-                # Indexer compressor ring: index_head_dim, overlap, ring_size=8.
-                self.indexer_state_ring.append(
-                    CompressStateRing(
-                        n_slots=sizes.idx_state_slots[L],
-                        ring_size=ring_size_for_ratio(4),
-                        overlap=True,
-                        head_dim=self.index_head_dim,
-                        device=device,
+                if sizes.idx_state_slots[L] is not None:
+                    self.indexer_state_ring.append(
+                        CompressStateRing(
+                            n_slots=sizes.idx_state_slots[L],
+                            ring_size=ring_size_for_ratio(4),
+                            overlap=True,
+                            head_dim=self.index_head_dim,
+                            device=device,
+                        )
                     )
-                )
+                else:
+                    self.indexer_state_ring.append(None)
             else:
                 self.idx_pool.append(None)
                 self.indexer_state_ring.append(None)
                 self.idx_scratch_base.append(None)
 
-            self.state_ring.append(
-                CompressStateRing(
-                    n_slots=sizes.state_slots[L],
-                    ring_size=ring_size_for_ratio(ratio),
-                    overlap=(ratio == 4),
-                    head_dim=self.head_dim,
-                    device=device,
+            if sizes.state_slots[L] is not None:
+                self.state_ring.append(
+                    CompressStateRing(
+                        n_slots=sizes.state_slots[L],
+                        ring_size=ring_size_for_ratio(ratio),
+                        overlap=(ratio == 4),
+                        head_dim=self.head_dim,
+                        device=device,
+                    )
                 )
-            )
+            else:
+                self.state_ring.append(None)
 
     # ----- full-loc translation (gather-only -1 safety; see field comment) -----
     def translate_full_to_window(self, full_locs: torch.Tensor) -> torch.Tensor:
@@ -451,7 +466,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self.sizes = sizes
         self.window_pool = self.cmp_pool = self.idx_pool = None
         self.state_ring = self.indexer_state_ring = None
-        self.full_to_window = None
+        self.full_to_window = self.token_cache = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -571,6 +586,8 @@ class DSV4PagedKVCache(BaseKVCachePool):
 
     def total_bytes(self) -> int:
         n = self.full_to_window.numel() * self.full_to_window.element_size()
+        if self.token_cache is not None:
+            n += self.token_cache.numel() * self.token_cache.element_size()
         n += sum(t.numel() * t.element_size() for t in self.window_pool)
         n += sum(t.numel() * t.element_size() for t in self.cmp_pool if t is not None)
         n += sum(t.numel() * t.element_size() for t in self.idx_pool if t is not None)

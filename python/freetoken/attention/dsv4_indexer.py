@@ -57,7 +57,7 @@ class IndexerBackendMixin:
 
     def indexer_select_prefill(
         self, scores: torch.Tensor, *, start_pos: int, seqlen: int, ratio: int, topk: int,
-        offset: int,
+        offset: int, sort_by_position: bool = False,
     ) -> torch.Tensor:
         """Causal top-k over compressed blocks for a prefill/extend range.
 
@@ -70,17 +70,26 @@ class IndexerBackendMixin:
         live = ((start_pos + torch.arange(1, seqlen + 1, device=device)) // ratio).unsqueeze(1)
         blk = torch.arange(n_blocks, device=device).repeat(seqlen, 1)
         scores = scores + torch.where(blk >= live, float("-inf"), 0)
-        picks = scores.topk(min(topk, n_blocks), dim=-1)[1]
+        picks = scores.topk(
+            min(topk, n_blocks), dim=-1, sorted=not sort_by_position
+        )[1]
+        if sort_by_position:
+            picks = picks.sort(dim=-1).values
         return torch.where(picks >= live, -1, picks + offset)
 
     def indexer_select_decode(
-        self, scores: torch.Tensor, *, valid: torch.Tensor, topk: int, offset: int
+        self, scores: torch.Tensor, *, valid: torch.Tensor, topk: int, offset: int,
+        sort_by_position: bool = False,
     ) -> torch.Tensor:
         """Top-k over a decode step's staged scores. Columns past each row's live count already
         score ``-inf`` (the scoring kernel writes them), so they sort last -- which is what lets
         the attention layer bound the sparse kernel with a single per-row count."""
         n_stage = scores.shape[-1]
-        picks = scores.topk(min(topk, n_stage), dim=-1)[1]
+        picks = scores.topk(
+            min(topk, n_stage), dim=-1, sorted=not sort_by_position
+        )[1]
+        if sort_by_position:
+            picks = picks.sort(dim=-1).values
         return torch.where(picks >= valid[:, None, None], -1, picks + offset)
 
 

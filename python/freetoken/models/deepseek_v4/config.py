@@ -1,4 +1,4 @@
-"""Engine-facing config for DeepSeek-V4-Flash.
+"""Engine-facing config for DeepSeek-V4 Flash/Pro.
 
 ``parse_config`` maps the standard transformer fields the engine needs (layer
 count, hidden size, vocab, MoE expert counts, etc.) into :class:`ModelConfig`,
@@ -72,6 +72,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         architectures=["DeepseekV4ForCausalLM"],
         moe_enabled=True,
         expert_quant="ds_fp4",
+        owner_ep_expert_quants=("ds_fp4",),
         # NB: DSV4 has MoE on every layer (no dense-replace) and reads its routing /
         # shared-expert / scaling config from dsv4_args, so the generic DeepSeek-family
         # MoE ModelConfig fields (first_k_dense_replace / n_shared_experts /

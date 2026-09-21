@@ -1,5 +1,7 @@
 # Supported models
 
+开发或审查模型的多卡实现时，请按[模型 TP/EP 多卡适配规范](tp-ep-model-adaptation.md)完成 geometry、loader、kernel、KV/state、视觉塔和验收矩阵；通用框架不把并行度写死为固定规模，具体 checkpoint 的合法 `P` 由其全部分片约束共同决定。
+
 FreeToken loads HF safetensors checkpoints directly. The checkpoints below are known-good — the prebuilt kernels are tuned
 for them; other checkpoints of the same architectures work too.
 

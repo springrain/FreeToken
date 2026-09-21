@@ -1,4 +1,4 @@
-"""DeepSeek-V4-Flash hyperparameters.
+"""DeepSeek-V4 Flash/Pro hyperparameters.
 
 Field names mirror the authors' ``inference/config.json`` (consumed by the
 reference ``ModelArgs``) so the port stays 1:1 with the reference. ``load_args``
@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Literal, Tuple
+
+from freetoken.utils.hf import optional_hf_file
 
 
 @dataclass
@@ -88,6 +90,11 @@ def _config_path(model_path: str) -> str:
     for path in candidates:
         if os.path.exists(path):
             return path
+    if not os.path.isdir(model_path):
+        for filename in ("inference/config.json", "model_args.json"):
+            path = optional_hf_file(model_path, filename)
+            if path is not None:
+                return path
     raise FileNotFoundError(
         f"No DeepSeek-V4 ModelArgs JSON found under {model_path} "
         f"(looked for inference/config.json)"

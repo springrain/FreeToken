@@ -1,23 +1,23 @@
 """Block-scaled FP8 (e4m3) linear for DeepSeek-V4, matching the reference numerics.
 
 The reference (``inference/model.py`` ``linear`` + ``inference/kernel.py``
-``act_quant``/``fp8_gemm``) quantizes the *activation* to FP8 with a per-128 block
+``act_quant``/``fp8_gemm``) quantizes the *activation* to FP8 with a per-block
 power-of-two (ue8m0) scale, then runs an FP8xFP8 block-scaled GEMM against the FP8
-weight (which carries its own 128x128 ue8m0 block scale). Both operands' scales are
-applied per 128-K block to a separate FP32 accumulator. This module reproduces that:
+weight (which carries its own square ue8m0 block scale). Both operands' scales are
+applied per K block to a separate FP32 accumulator. This module reproduces that:
 
-  ``y = fp8_gemm(act_quant(x, 128, ue8m0), weight_fp8, weight_scale_e8m0)``
+  ``y = fp8_gemm(act_quant(x, block, ue8m0), weight_fp8, weight_scale_e8m0)``
 
 ``act_quant`` (reference): per block ``s = 2**ceil(log2(max(|x|,1e-4)/448))`` (exact
 via IEEE bit ops -> matches ``fast_round_scale``), ``x_fp8 = round_e4m3(clamp(x/s,
 +-448))``, scale stored e8m0. The GEMM accumulates ``sum_k (A_fp8 @ B_fp8) * s_a * s_b``
-per 128-K block in FP32.
+per K block in FP32. DeepSeek-V4 uses block 128; DeepSeek-V4.1 uses block 32.
 
 Also provides ``act_quant_fp8_inplace`` -- the fused FP8 quant+dequant round-trip the
 reference applies in-place to the window / compressor KV (``act_quant(..., 64, ...,
 inplace=True)``), returning BF16.
 
-Assumes ``K % 128 == 0`` and ``N % 128 == 0`` (true for every DeepSeek-V4 projection).
+The supported square block sizes are 32 and 128.
 """
 
 from __future__ import annotations
@@ -107,6 +107,7 @@ def act_quant_fp8(x: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torc
 def _act_quant_inplace_kernel(
     x_ptr, o_ptr, M, N, stride_m, stride_n, stride_om, stride_on,
     FP8_MIN, FP8_MAX, INV_MAX, FP4: tl.constexpr,
+    FP4_SCALE_E4M3: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK: tl.constexpr,
 ):
     """Fused quant+dequant round-trip (reference ``inplace=True``), written to ``o_ptr`` as
@@ -122,11 +123,23 @@ def _act_quant_inplace_kernel(
     x = tl.load(ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=1)
     if FP4:
-        amax = tl.maximum(amax, 6.0 * (2.0 ** -126))
+        if FP4_SCALE_E4M3:
+            # V4.1 compressed KV uses an e4m3 scale. Keep all-zero groups at the
+            # smallest e4m3 subnormal, matching the official inference kernel.
+            amax = tl.maximum(amax, 6.0 * (2.0 ** -9))
+        else:
+            amax = tl.maximum(amax, 6.0 * (2.0 ** -126))
     else:
         amax = tl.maximum(amax, 1e-4)
-    e = _log2_ceil(amax * INV_MAX)
-    s = tl.exp2(e.to(tl.float32))
+    if FP4 and FP4_SCALE_E4M3:
+        raw_scale = amax * INV_MAX
+        if e4m3_native_cx():
+            s = raw_scale.to(tl.float8e4nv).to(tl.float32)
+        else:
+            s = round_e4m3(raw_scale)
+    else:
+        e = _log2_ceil(amax * INV_MAX)
+        s = tl.exp2(e.to(tl.float32))
     q = tl.clamp(x / s[:, None], FP8_MIN, FP8_MAX)
     if FP4:
         q = _round_fp4(q)
@@ -172,7 +185,8 @@ def act_quant_fp8_inplace(x: torch.Tensor, block: int = 64) -> torch.Tensor:
     grid = (triton.cdiv(M, BLOCK_M), N // block)
     _act_quant_inplace_kernel[grid](
         x2d, x2d, M, N, x2d.stride(0), x2d.stride(1), x2d.stride(0), x2d.stride(1),
-        -448.0, 448.0, 1.0 / 448.0, False, BLOCK_M=BLOCK_M, BLOCK=block,
+        -448.0, 448.0, 1.0 / 448.0, False, False,
+        BLOCK_M=BLOCK_M, BLOCK=block,
     )
     return x
 
@@ -190,14 +204,31 @@ def act_quant_fp8_roundtrip(x: torch.Tensor, block: int = 128) -> torch.Tensor:
     grid = (triton.cdiv(M, BLOCK_M), N // block)
     _act_quant_inplace_kernel[grid](
         x2d, out, M, N, x2d.stride(0), x2d.stride(1), out.stride(0), out.stride(1),
-        -448.0, 448.0, 1.0 / 448.0, False, BLOCK_M=BLOCK_M, BLOCK=block,
+        -448.0, 448.0, 1.0 / 448.0, False, False,
+        BLOCK_M=BLOCK_M, BLOCK=block,
     )
     return out.reshape(x.shape)
 
 
-def fp4_act_quant_inplace(x: torch.Tensor, block: int = 32) -> torch.Tensor:
-    """Reference ``fp4_act_quant(x, block, inplace=True)``: FP4 quant+dequant round-trip
-    written back into ``x`` (BF16)."""
+def fp4_act_quant_inplace(
+    x: torch.Tensor,
+    block: int = 32,
+    *,
+    scale_dtype: torch.dtype = torch.float8_e8m0fnu,
+) -> torch.Tensor:
+    """Reference FP4 quant+dequant round-trip written back into ``x``.
+
+    DeepSeek-V4 indexer activations use e8m0 scales; DeepSeek-V4.1 compressed KV
+    uses e4m3 scales. The scale itself is transient in the in-place path, but its
+    rounding changes the dequantized BF16 values.
+    """
+    if scale_dtype not in (torch.float8_e8m0fnu, torch.float8_e4m3fn):
+        raise ValueError(f"FP4 scale dtype must be e8m0 or e4m3, got {scale_dtype}")
+    allowed_blocks = (16, 32) if scale_dtype is torch.float8_e4m3fn else (32,)
+    if block not in allowed_blocks:
+        raise ValueError(
+            f"FP4 {scale_dtype} scale supports block sizes {allowed_blocks}, got {block}"
+        )
     *lead, N = x.shape
     assert N % block == 0, (N, block)
     x2d = x.reshape(-1, N)
@@ -206,9 +237,15 @@ def fp4_act_quant_inplace(x: torch.Tensor, block: int = 32) -> torch.Tensor:
     grid = (triton.cdiv(M, BLOCK_M), N // block)
     _act_quant_inplace_kernel[grid](
         x2d, x2d, M, N, x2d.stride(0), x2d.stride(1), x2d.stride(0), x2d.stride(1),
-        -6.0, 6.0, 1.0 / 6.0, True, BLOCK_M=BLOCK_M, BLOCK=block,
+        -6.0, 6.0, 1.0 / 6.0, True, scale_dtype is torch.float8_e4m3fn,
+        BLOCK_M=BLOCK_M, BLOCK=block,
     )
     return x
+
+
+def fp4_act_quant_e4m3_inplace(x: torch.Tensor, block: int = 16) -> torch.Tensor:
+    """V4.1 compressed-KV FP4 round-trip with per-block e4m3 scales."""
+    return fp4_act_quant_inplace(x, block, scale_dtype=torch.float8_e4m3fn)
 
 
 # ======================================================================================
@@ -218,14 +255,15 @@ def fp4_act_quant_inplace(x: torch.Tensor, block: int = 32) -> torch.Tensor:
 def _fp8_act_gemm_kernel(
     a_ptr,            # [M, K] float8_e4m3fn (quantized activation)
     w_ptr,            # [N, K] float8_e4m3fn
-    sa_ptr,           # [M, K//128] uint8 (e8m0 act codes)
-    sb_ptr,           # [N//128, K//128] uint8 (e8m0 weight codes)
+    sa_ptr,           # [M, K//BLOCK_K] uint8 (e8m0 act codes)
+    sb_ptr,           # [N//SCALE_BLOCK_N, K//BLOCK_K] uint8 (e8m0 weight codes)
     c_ptr,            # [M, N] compute dtype
     M, N, K,
     stride_am, stride_ak, stride_wn, stride_wk,
     stride_sam, stride_sak, stride_sbn, stride_sbk,
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SCALE_BLOCK_N: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -234,13 +272,14 @@ def _fp8_act_gemm_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     m_mask = offs_m < M
+    n_mask = offs_n < N
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     num_k = tl.cdiv(K, BLOCK_K)
     for k in range(num_k):
         a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
-        w = tl.load(w_ptrs)
+        w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
         if e4m3_native_cx():
             p = tl.dot(a, tl.trans(w), out_dtype=tl.float32)
         else:
@@ -248,43 +287,59 @@ def _fp8_act_gemm_kernel(
             p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(tl.bfloat16)), out_dtype=tl.float32)
         sa_code = tl.load(sa_ptr + offs_m * stride_sam + k * stride_sak, mask=m_mask, other=0)
         sca = tl.exp2(sa_code.to(tl.float32) - 127.0)            # [BLOCK_M]
-        sb_code = tl.load(sb_ptr + pid_n * stride_sbn + k * stride_sbk)
-        scb = tl.exp2(sb_code.to(tl.float32) - 127.0)            # scalar (one 128-N block)
-        acc += p * sca[:, None] * scb
+        if SCALE_BLOCK_N == BLOCK_N:
+            # V4 128x128: retain the original scalar load/broadcast path.
+            sb_code = tl.load(sb_ptr + pid_n * stride_sbn + k * stride_sbk)
+            scb = tl.exp2(sb_code.to(tl.float32) - 127.0)
+            acc += p * sca[:, None] * scb
+        else:
+            # V4.1 32x32: one 128-row output tile spans four weight-scale rows.
+            sb_code = tl.load(
+                sb_ptr + (offs_n // SCALE_BLOCK_N) * stride_sbn + k * stride_sbk,
+                mask=n_mask,
+                other=0,
+            )
+            scb = tl.exp2(sb_code.to(tl.float32) - 127.0)
+            acc += p * sca[:, None] * scb[None, :]
         a_ptrs += BLOCK_K * stride_ak
         w_ptrs += BLOCK_K * stride_wk
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(c_ptrs, acc.to(compute_type), mask=m_mask[:, None])
+    tl.store(
+        c_ptrs,
+        acc.to(compute_type),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
 
 
 @triton.jit
 def _fp8_act_gemv_splitk_kernel(
     a_ptr,            # [K] float8_e4m3fn
-    sa_ptr,           # [K//128] uint8 (e8m0 act codes)
+    sa_ptr,           # [K//BLOCK_SIZE_K] uint8 (e8m0 act codes)
     w_ptr,            # [N, K] float8_e4m3fn
-    sb_ptr,           # [N//128, K//128] uint8 (e8m0 weight codes)
+    sb_ptr,           # [N//SCALE_BLOCK_N, K//BLOCK_SIZE_K] uint8
     part_ptr,         # [SPLIT_K, N] fp32
     N, K,
     stride_ak, stride_wn, stride_wk, stride_sbn, stride_sbk, stride_pk, stride_pn,
-    BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
-    sn = offs_n // 128
+    sn = offs_n // SCALE_BLOCK_N
     k_per = K // SPLIT_K
     k_start = pid_k * k_per
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    for k0 in range(0, k_per, 128):
-        offs_k = k_start + k0 + tl.arange(0, 128)
+    for k0 in range(0, k_per, BLOCK_SIZE_K):
+        offs_k = k_start + k0 + tl.arange(0, BLOCK_SIZE_K)
         a = tl.load(a_ptr + offs_k * stride_ak).to(tl.float32)
         w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
         if e4m3_native_cx():
             w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
         else:
             w = e4m3_u8_to_f32(tl.load(w_ptrs, mask=n_mask[:, None], other=0))
-        kb = (k_start + k0) // 128
+        kb = (k_start + k0) // BLOCK_SIZE_K
         sb_code = tl.load(sb_ptr + sn * stride_sbn + kb * stride_sbk, mask=n_mask, other=0)
         scb = tl.exp2(sb_code.to(tl.float32) - 127.0)
         sa_code = tl.load(sa_ptr + kb)
@@ -316,29 +371,39 @@ _DECODE_FP8_CFG = {
 }
 
 
-def _decode_cfg(N: int, K: int) -> tuple[int, int, int]:
+def _decode_cfg(N: int, K: int, block_size: int) -> tuple[int, int, int]:
     cfg = _DECODE_FP8_CFG.get((N, K))
     if cfg is not None:
         bn, sk, nw = cfg
-        return bn, max(1, min(sk, K // 128)), nw
+        sk = max(1, min(sk, K // block_size))
+        while sk > 1 and K % (sk * block_size):
+            sk //= 2
+        return bn, sk, nw
     bn = 16
     n_tiles = triton.cdiv(N, bn)
     sk = max(1, 1536 // n_tiles)
     sk = 1 << (sk.bit_length() - 1)
-    return bn, max(1, min(sk, K // 128)), 1
+    sk = max(1, min(sk, K // block_size))
+    while sk > 1 and K % (sk * block_size):
+        sk //= 2
+    return bn, sk, 1
 
 
 def _fp8_act_gemv(a_fp8: torch.Tensor, sa: torch.Tensor, weight: torch.Tensor,
-                  sb: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+                   sb: torch.Tensor, out_dtype: torch.dtype, block_size: int) -> torch.Tensor:
     N, K = weight.shape
-    BLOCK_N, split_k, num_warps = _decode_cfg(N, K)
+    BLOCK_N, split_k, num_warps = _decode_cfg(N, K, block_size)
     n_tiles = triton.cdiv(N, BLOCK_N)
     part = torch.empty((split_k, N), dtype=torch.float32, device=a_fp8.device)
     _fp8_act_gemv_splitk_kernel[(n_tiles, split_k)](
         a_fp8, sa, weight, sb, part, N, K,
         a_fp8.stride(0), weight.stride(0), weight.stride(1),
         sb.stride(0), sb.stride(1), part.stride(0), part.stride(1),
-        BLOCK_N=BLOCK_N, SPLIT_K=split_k, num_warps=num_warps,
+        BLOCK_N=BLOCK_N,
+        BLOCK_SIZE_K=block_size,
+        SCALE_BLOCK_N=block_size,
+        SPLIT_K=split_k,
+        num_warps=num_warps,
     )
     out = torch.empty(N, dtype=out_dtype, device=a_fp8.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256),)](
@@ -353,28 +418,39 @@ def block_fp8_linear(
     weight: torch.Tensor,
     scale: torch.Tensor,
     bias: torch.Tensor | None = None,
+    *,
+    block_size: int = 128,
 ) -> torch.Tensor:
     """``y = act_quant(x) @ weight^T`` (reference FP8 path).
 
     ``x``: ``[..., K]`` bf16; ``weight``: ``[N, K]`` float8_e4m3fn; ``scale``:
-    ``[N//128, K//128]`` float8_e8m0fnu (weight block scale). Activation is quantized
-    to FP8 with a per-128 ue8m0 scale; the GEMM applies both scales per 128-K block.
+    ``[N//block_size, K//block_size]`` float8_e8m0fnu (weight block scale).
+    Activation uses the same K block; supported block sizes are 32 and 128.
     """
     assert weight.dtype == FP8
     *lead, K = x.shape
     N = weight.shape[0]
     assert weight.shape[1] == K
-    assert K % 128 == 0 and N % 128 == 0, (N, K)
+    assert block_size in (32, 128), block_size
+    assert K % block_size == 0 and N % block_size == 0, (N, K, block_size)
+    assert scale.shape == (N // block_size, K // block_size), (
+        scale.shape,
+        N,
+        K,
+        block_size,
+    )
     compute_dtype = x.dtype if x.dtype in _TL_DTYPE else torch.bfloat16
     sb = scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
     sb = sb.contiguous()
     w = e4m3_kernel_view(weight)
 
-    a_fp8, sa = act_quant_fp8(x, 128)  # [M,K] fp8, [M,K//128] e8m0 codes
+    a_fp8, sa = act_quant_fp8(x, block_size)
     M = a_fp8.shape[0]
 
     if M == 1:
-        out = _fp8_act_gemv(a_fp8[0], sa[0], w, sb, compute_dtype).reshape(*lead, N)
+        out = _fp8_act_gemv(
+            a_fp8[0], sa[0], w, sb, compute_dtype, block_size
+        ).reshape(*lead, N)
         if bias is not None:
             out = out + bias.to(out.dtype)
         return out
@@ -382,7 +458,7 @@ def block_fp8_linear(
     out = torch.empty((M, N), dtype=compute_dtype, device=x.device)
     BLOCK_M = 32
     BLOCK_N = 128
-    BLOCK_K = 128
+    BLOCK_K = block_size
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _fp8_act_gemm_kernel[grid](
         a_fp8, w, sa, sb, out,
@@ -390,8 +466,13 @@ def block_fp8_linear(
         a_fp8.stride(0), a_fp8.stride(1), w.stride(0), w.stride(1),
         sa.stride(0), sa.stride(1), sb.stride(0), sb.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        compute_type=_TL_DTYPE[compute_dtype], num_warps=4, num_stages=3,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        SCALE_BLOCK_N=block_size,
+        compute_type=_TL_DTYPE[compute_dtype],
+        num_warps=4,
+        num_stages=3 if block_size == 128 else 2,
     )
     out = out.reshape(*lead, N)
     if bias is not None:
@@ -399,4 +480,10 @@ def block_fp8_linear(
     return out
 
 
-__all__ = ["block_fp8_linear", "act_quant_fp8", "act_quant_fp8_inplace", "fp4_act_quant_inplace"]
+__all__ = [
+    "block_fp8_linear",
+    "act_quant_fp8",
+    "act_quant_fp8_inplace",
+    "fp4_act_quant_inplace",
+    "fp4_act_quant_e4m3_inplace",
+]

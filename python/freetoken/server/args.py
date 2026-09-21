@@ -286,8 +286,8 @@ def parse_args(
         default=1,
         help=(
             "Routed-expert owner group size. Default 1 keeps the legacy global-ID MoE cache; "
-            "values >1 are an explicit TP+EP opt-in and currently require the owner runtime "
-            "to be supported by the selected model."
+            "values above 1 enable same-group TP+EP and must equal --tensor-parallel-size. "
+            "The selected model/format must implement owner-local experts."
         ),
     )
 
@@ -852,7 +852,7 @@ def parse_args(
         parser.error("--moe-ep-size must be >= 1")
     if kwargs["moe_ep_size"] > 1 and kwargs["moe_ep_size"] != kwargs["tensor_parallel_size"]:
         parser.error(
-            "--moe-ep-size must equal --tensor-parallel-size for the initial same-group TP+EP "
+            "--moe-ep-size must equal --tensor-parallel-size for the same-group TP+EP "
             "topology"
         )
 

@@ -74,7 +74,9 @@ class SchedulerIOMixin:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:
+        logger.debug("[STARTUP] scheduler.barrier.begin")
         self.tp_cpu_group.barrier().wait()
+        logger.debug("[STARTUP] scheduler.barrier.done")
 
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []

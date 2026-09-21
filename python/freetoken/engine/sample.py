@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, List
 
 import torch
-from freetoken.utils import is_sm90_supported, nvtx_annotate
+from freetoken.utils import init_logger, is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -30,7 +34,17 @@ def sample_impl(
 ) -> torch.Tensor:
     from freetoken.kernel.backend import is_flashinfer_installed
 
-    if is_flashinfer_installed():
+    use_flashinfer = is_flashinfer_installed()
+    if logger.isEnabledFor(logging.DEBUG):
+        capability = torch.cuda.get_device_capability(logits.device) if logits.is_cuda else "cpu"
+        logger.debug(
+            "[SAMPLER] backend=%s device=%s capability=%s logits_shape=%s",
+            "flashinfer" if use_flashinfer else "triton",
+            logits.device,
+            capability,
+            tuple(logits.shape),
+        )
+    if use_flashinfer:
         import flashinfer.sampling as sampling
     else:
         import freetoken.kernel.triton.sampling as sampling

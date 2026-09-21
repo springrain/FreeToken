@@ -473,6 +473,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
+        owner_ep_expert_quants=("nvfp4",),
         attn_quant=attn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,

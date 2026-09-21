@@ -1,4 +1,4 @@
-"""DeepSeek-V4-Flash model (engine-native FreeToken port of inference/model.py).
+"""DeepSeek-V4 Flash/Pro model (engine-native FreeToken port of inference/model.py).
 
 A faithful single-stream port of the reference (MLA attention with a sliding window
 + stateful KV compressors / Lightning Indexer, manifold-constrained Hyper-Connections,
@@ -30,6 +30,7 @@ from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNorm, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
 from .attention import Attention
@@ -42,15 +43,36 @@ from .layers import get_compress_topk_idxs, get_window_topk_idxs  # noqa: F401
 from .moe import Expert, Gate  # noqa: F401
 
 
+logger = init_logger(__name__)
+
+
 class Block(BaseOP):
     """Decoder block with manifold-constrained Hyper-Connections (4 residual streams)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        expert_tp_size: int | None = None,
+        quant_config=None,
+        prefix: str = "",
+    ):
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.dim = args.dim
         self.attn = Attention(layer_id, args, quant_config=quant_config, prefix=f"{prefix}.attn")
-        self.ffn = MoE(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.ffn")
+        self.ffn = MoE(
+            layer_id,
+            args,
+            strategy=strategy,
+            decode_target=decode_target,
+            expert_tp_size=expert_tp_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ffn",
+        )
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -122,13 +144,33 @@ class Block(BaseOP):
 
 
 class Transformer(BaseOP):
-    def __init__(self, args: DeepseekV4Args, quant_config=None, *, strategy: str = "offload", decode_target: str = "gpu", prefix: str = ""):
+    def __init__(
+        self,
+        args: DeepseekV4Args,
+        quant_config=None,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        expert_tp_size: int | None = None,
+        prefix: str = "",
+    ):
         self.args = args
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
-        self.layers = OPList([Block(i, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
+        self.layers = OPList([
+            Block(
+                i,
+                args,
+                strategy=strategy,
+                decode_target=decode_target,
+                expert_tp_size=expert_tp_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.layers.{i}",
+            )
+            for i in range(args.n_layers)
+        ])
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = ParallelLMHead(args.vocab_size, args.dim, quant_config=quant_config, prefix=f"{prefix}.head")
         hc_dim = hc_mult * args.dim
@@ -163,13 +205,20 @@ class Transformer(BaseOP):
         # metadata; ``flat_positions`` [T] is the scheduler-staged batch.positions (per-token
         # ABSOLUTE position); the head picks each request's final token off the attention
         # metadata -> its next-token logits row.
+        logger.debug(
+            "[DSV4_TRACE] transformer.prefill.begin tokens=%d segments=%s",
+            input_ids.numel(),
+            segments,
+        )
         h = self.embed.forward(input_ids.view(-1)).view(1, -1, self.args.dim)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers.op_list:
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
         h = self.hc_head(h)
         h = self.norm.forward(h)
-        return self.head.forward(h[0])  # [B, vocab]
+        out = self.head.forward(h[0])  # [B, vocab]
+        logger.debug("[DSV4_TRACE] transformer.prefill.done logits=%s", tuple(out.shape))
+        return out
 
     def decode(
         self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
@@ -184,6 +233,12 @@ class Transformer(BaseOP):
         # LOCAL row ``rows`` = arange(B). So the next batch's allocate_paged cannot corrupt this
         # in-flight replay (it mutates only the live map).
         B = input_ids.size(0)
+        logger.debug(
+            "[DSV4_TRACE] transformer.decode.begin batch=%d pos_shape=%s cmp_stage_cap=%d",
+            B,
+            tuple(pos.shape),
+            cmp_stage_cap,
+        )
         rows = torch.arange(B, device=input_ids.device)
         h = self.embed.forward(input_ids.view(-1)).view(B, 1, self.args.dim)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
@@ -197,7 +252,9 @@ class Transformer(BaseOP):
             h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
         h = self.hc_head(h)
         h = self.norm.forward(h)
-        return self.head.forward(h[:, -1])
+        out = self.head.forward(h[:, -1])
+        logger.debug("[DSV4_TRACE] transformer.decode.done logits=%s", tuple(out.shape))
+        return out
 
 
 class DeepseekV4ForCausalLM(BaseLLMModel):
@@ -209,15 +266,29 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def __init__(self, config):
         self._config = config
         self._args: DeepseekV4Args = config.dsv4_args
-        self.model = Transformer(self._args, config.quant, strategy=config.moe_strategy, decode_target=config.decode_target, prefix="model")
+        expert_tp_size = 1 if getattr(config, "moe_ep_size", 1) > 1 else None
+        self.model = Transformer(
+            self._args,
+            config.quant,
+            strategy=config.moe_strategy,
+            decode_target=config.decode_target,
+            expert_tp_size=expert_tp_size,
+            prefix="model",
+        )
         self._bound = False
 
     def _ensure_bound(self) -> None:
         if self._bound:
             return
         pool = get_global_ctx().kv_cache
+        logger.debug(
+            "[DSV4_TRACE] model.bind.begin pool=%s device=%s",
+            type(pool).__name__,
+            pool.device,
+        )
         self.model.bind(pool, pool.device)
         self._bound = True
+        logger.debug("[DSV4_TRACE] model.bind.done")
 
     def mark_for_rebind(self) -> None:
         """Force a re-bind on the next forward. The model holds NO pool reference -- buffers are read
@@ -231,6 +302,12 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         input_ids = batch.input_ids.long()
         md = batch.attn_metadata
+        logger.debug(
+            "[DSV4_TRACE] model.forward.begin phase=%s input_shape=%s positions=%s",
+            batch.phase,
+            tuple(input_ids.shape),
+            tuple(batch.positions.shape),
+        )
         if batch.is_prefill:
             # Ragged batched prefill (bs >= 1): each request starts from its own cached_len.
             # A cold segment (start_pos == 0) re-seeds the compressor carry register inside its
@@ -238,9 +315,11 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             # FROM THE RING. Per-token ops (embed / HC / norm / MoE) run batched over the
             # concatenated tokens; attention runs per segment so the carry / slot maps never
             # cross requests.
-            return self.model.prefill_batched(
+            out = self.model.prefill_batched(
                 input_ids.view(1, -1), md.segments, batch.positions.long(),
             )
+            logger.debug("[DSV4_TRACE] model.forward.done phase=prefill")
+            return out
         # DECODE (bs>=1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1
         # under graph capture (so the captured static-shape graph serves any real replay position).
@@ -254,7 +333,9 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             cmp_stage_cap = md.stage_width - 1
         else:
             cmp_stage_cap = int(pos.max().item())
-        return self.model.decode(input_ids.view(B, 1), pos, cmp_stage_cap)
+        out = self.model.decode(input_ids.view(B, 1), pos, cmp_stage_cap)
+        logger.debug("[DSV4_TRACE] model.forward.done phase=decode")
+        return out
 
 
 __all__ = ["Transformer", "DeepseekV4ForCausalLM"]

@@ -55,8 +55,8 @@ class OwnedRoute:
 class ExpertOwnership:
     """Contiguous expert ownership for one rank in an EP group.
 
-    The first implementation intentionally requires an even partition.  An interleaved or
-    history-weighted owner map can be added later, but it must preserve the same explicit
+    The first implementation intentionally uses a contiguous equal partition.  An interleaved
+    or history-weighted owner map can be added later, but it must preserve the same explicit
     global/local/slot boundary and be tested independently.
     """
 

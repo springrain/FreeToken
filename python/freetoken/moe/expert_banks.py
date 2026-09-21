@@ -9,6 +9,7 @@ use their own providers until they get a method.
 from __future__ import annotations
 
 import glob
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -90,6 +91,16 @@ def build_expert_banks(
 
     kernel = method.kernel
     layout = method.layout()
+    logger.debug(
+        "[STARTUP] expert_banks.build.begin method=%s kind=%s layers=%d experts=%s "
+        "dummy=%s streamed=%s",
+        type(method).__name__,
+        getattr(method, "kind", None),
+        num_layers,
+        num_experts,
+        dummy,
+        layer_sink is not None,
+    )
     # Owner-local EP fills only this rank's rows, so the bank's E dim is the local expert
     # count, not the layer's (global) routing count. ``num_experts`` overrides it.
     E = method.cfg.num_experts if num_experts is None else num_experts
@@ -119,6 +130,7 @@ def build_expert_banks(
         tracker = LayerCompletionTracker(E, hb, sink) if sink is not None else None
         # a reader that skips a layer or mislabels a piece must fail here, not serve uninitialized rows
         written = torch.zeros(num_layers, E, dtype=torch.int32)
+        reported_layers: set[int] = set()
         for layer_id, e0, e1, piece in pieces:
             if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
                 raise ValueError(f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}")
@@ -133,6 +145,18 @@ def build_expert_banks(
             if tracker is not None:
                 for _ in range(e1 - e0):
                     tracker.note(layer_id)
+            if (
+                logger.isEnabledFor(logging.DEBUG)
+                and layer_id not in reported_layers
+                and int(written[layer_id].sum()) == E
+            ):
+                reported_layers.add(layer_id)
+                logger.debug(
+                    "[STARTUP] expert_banks.layer.done layer=%d/%d experts=%d",
+                    layer_id,
+                    num_layers,
+                    E,
+                )
         missing = (written == 0).nonzero().tolist()
         if missing:
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
@@ -326,6 +350,18 @@ def load_expert_banks(
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
+    logger.debug(
+        "[STARTUP] expert_banks.load.begin model=%s method=%s parallel=%s dummy=%s "
+        "layers=%s experts=%s owner=%s",
+        model_path,
+        type(method).__name__ if method is not None else None,
+        parallel,
+        dummy,
+        getattr(model_config, "num_moe_layers", None),
+        getattr(model_config, "num_experts", None),
+        ownership is not None,
+    )
+
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         if ownership is not None:
             # ``load_ftw_banks`` rebuilds ``[num_experts, ...]`` GLOBAL rows and has no
@@ -368,6 +404,11 @@ def load_expert_banks(
             )
             parallel = False
     logger.info_rank0(f"expert banks: slow path ({'parallel' if parallel else 'serial'} build)")
+    logger.debug(
+        "[STARTUP] expert_banks.strategy resolved=%s parallel_reader_supported=%s",
+        "parallel" if parallel else "serial",
+        _PARALLEL_READER_SUPPORTED,
+    )
     # parallel's reader resolves hub ids + handles single-file/no-index checkpoints, so it won't
     # OSError on those (which would leak the banks it pre-allocated, since host banks live for
     # the process). Only NotImplementedError (quant has no parallel reader; raised before any
@@ -387,7 +428,15 @@ def load_expert_banks(
                 raise
             logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
             banks = _build(False)
-    return _echo_residency(banks, layer_residency, residency_plan)
+    banks = _echo_residency(banks, layer_residency, residency_plan)
+    logger.debug(
+        "[STARTUP] expert_banks.load.done format=%s kind=%s kernel=%s streamed=%s",
+        banks.quant_format,
+        banks.kind,
+        banks.kernel,
+        banks.streamed,
+    )
+    return banks
 
 
 def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:

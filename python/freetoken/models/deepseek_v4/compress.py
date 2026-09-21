@@ -10,9 +10,13 @@ from freetoken.kernel.triton.dsv4.compress import gated_pool
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace, fp4_act_quant_inplace
 from freetoken.kernel.triton.dsv4.hadamard import hadamard_transform
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
+from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
 from .ops import apply_rotary_emb, apply_rotary_emb_decode
+
+
+logger = init_logger(__name__)
 
 
 class Compressor(BaseOP):
@@ -132,7 +136,7 @@ class Compressor(BaseOP):
         # table row (its cmp row).
         assert self.cmp_pool is not None
         bsz, seqlen, _ = x.size()
-        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
+        ratio, overlap, rd = self.compress_ratio, self.overlap, self.rope_head_dim
         # start_pos>0 (radix re-prefill): carry-aware extend of the new tokens.
         if start_pos > 0:
             return self.extend(x, start_pos, window_slots, int(tail_window_slot), ti)
@@ -201,7 +205,7 @@ class Compressor(BaseOP):
         assert self.cmp_pool is not None
         assert start_pos % self.P == 0, "radix re-prefill boundary must be 128-aligned"
         bsz, seqlen, _ = x.size()
-        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
+        ratio, overlap, rd = self.compress_ratio, self.overlap, self.rope_head_dim
         dtype = x.dtype
         # Seed the register carry FROM the ring (the matched tail page covering
         # [start_pos-128, start_pos)). The producing request wrote this boundary carry by value.
@@ -404,6 +408,14 @@ class Indexer(BaseOP):
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int, window_slots: torch.Tensor, ti: int = 0):
         bsz, seqlen, _ = x.size()
+        logger.debug(
+            "[DSV4_TRACE] indexer.prefill.begin layer=%s tokens=%d start=%d ratio=%d topk=%d",
+            self.layer_id,
+            seqlen,
+            start_pos,
+            self.compress_ratio,
+            self.index_topk,
+        )
         freqs_cis = self._freqs_cis[start_pos:start_pos + seqlen]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
@@ -416,7 +428,18 @@ class Indexer(BaseOP):
         self.compressor.forward(x, start_pos, window_slots, ti=ti)  # scatters indexer keys to idx_pool
         weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
         keys = self.attn.indexer_keys(ti, end_pos // ratio, ratio, self.layer_id, bsz)
+        logger.debug(
+            "[DSV4_TRACE] indexer.prefill.keys layer=%s shape=%s q_shape=%s",
+            self.layer_id,
+            tuple(keys.shape),
+            tuple(q.shape),
+        )
         scores = self.attn.indexer_prefill_logits(q, keys, weights)
+        logger.debug(
+            "[DSV4_TRACE] indexer.prefill.scores layer=%s shape=%s",
+            self.layer_id,
+            tuple(scores.shape),
+        )
         return self.attn.indexer_select_prefill(
             scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
             topk=self.index_topk, offset=offset,
@@ -427,6 +450,14 @@ class Indexer(BaseOP):
         compressor extend (writes new idx blocks), scores each new query over compressed indexer
         blocks [0, end//ratio) with a causal mask, returns top-k block indices offset by ``offset``."""
         bsz, seqlen, _ = x.size()
+        logger.debug(
+            "[DSV4_TRACE] indexer.extend.begin layer=%s tokens=%d start=%d ratio=%d topk=%d",
+            self.layer_id,
+            seqlen,
+            start_pos,
+            self.compress_ratio,
+            self.index_topk,
+        )
         end = start_pos + seqlen
         freqs_cis = self._freqs_cis[start_pos:end]
         ratio, rd = self.compress_ratio, self.rope_head_dim
@@ -437,7 +468,18 @@ class Indexer(BaseOP):
         self.compressor.forward(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
         weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
         keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
+        logger.debug(
+            "[DSV4_TRACE] indexer.extend.keys layer=%s shape=%s q_shape=%s",
+            self.layer_id,
+            tuple(keys.shape),
+            tuple(q.shape),
+        )
         scores = self.attn.indexer_prefill_logits(q, keys, weights)
+        logger.debug(
+            "[DSV4_TRACE] indexer.extend.scores layer=%s shape=%s",
+            self.layer_id,
+            tuple(scores.shape),
+        )
         return self.attn.indexer_select_prefill(
             scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
             topk=self.index_topk, offset=offset,
@@ -457,6 +499,14 @@ class Indexer(BaseOP):
         fixed staging width (== max valid count in eager, a static capture width under graph)."""
         B = x.size(0)
         ratio, rd = self.compress_ratio, self.rope_head_dim
+        logger.debug(
+            "[DSV4_TRACE] indexer.decode.begin layer=%s batch=%d stage=%d ratio=%d topk=%d",
+            self.layer_id,
+            B,
+            n_stage,
+            ratio,
+            self.index_topk,
+        )
         q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb_decode(q[..., -rd:], self._freqs_cis.index_select(0, pos))  # per-row freqs
         q = hadamard_transform(q)
@@ -474,6 +524,11 @@ class Indexer(BaseOP):
             weights.reshape(B, self.n_heads),
             valid, n_stage, ratio, self.layer_id,
         ).view(B, 1, n_stage)
+        logger.debug(
+            "[DSV4_TRACE] indexer.decode.scores layer=%s shape=%s",
+            self.layer_id,
+            tuple(index_score.shape),
+        )
         return self.attn.indexer_select_decode(
             index_score, valid=valid, topk=self.index_topk, offset=offset
         )

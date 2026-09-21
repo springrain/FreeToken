@@ -92,4 +92,84 @@ def ple_gather_rows(
     return out
 
 
-__all__ = ["ple_gather_rows"]
+@triton.jit
+def _engram_gather_kernel(
+    weight_ptr,
+    scale_ptr,
+    ids_ptr,
+    out_ptr,
+    global_start,
+    local_rows,
+    EMB_DIM: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    global_idx = tl.load(ids_ptr + row).to(tl.int64)
+    local_idx = global_idx - global_start
+    in_range = (local_idx >= 0) & (local_idx < local_rows)
+    local_idx = tl.where(in_range, local_idx, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < EMB_DIM
+
+    if e4m3_native_cx():
+        wbase = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        values = tl.load(
+            wbase + local_idx * EMB_DIM + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+    else:
+        wbase = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        values = e4m3_u8_to_f32(
+            tl.load(wbase + local_idx * EMB_DIM + offsets, mask=mask, other=0)
+        )
+    sbase = scale_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+    code = tl.load(
+        sbase + local_idx * (EMB_DIM // GROUP) + offsets // GROUP,
+        mask=mask,
+        other=0,
+    )
+    scale = tl.exp2(code.to(tl.float32) - 127.0)
+    values = tl.where(in_range, values * scale, 0.0)
+    tl.store(
+        out_ptr + row * EMB_DIM + offsets,
+        values.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def engram_gather_rows(
+    weight_ptr: int,
+    scale_ptr: int,
+    *,
+    global_start: int,
+    local_rows: int,
+    embed_dim: int,
+    row_ids: torch.Tensor,
+    out: torch.Tensor,
+    group: int = 32,
+) -> torch.Tensor:
+    """Gather one rank's row shard of an FP8+E8M0 Engram table.
+
+    Global IDs outside ``[global_start, global_start + local_rows)`` produce zero rows;
+    callers SUM all ranks to obtain the complete lookup.
+    """
+    n = row_ids.numel()
+    assert embed_dim % group == 0, (embed_dim, group)
+    assert out.shape == (n, embed_dim) and out.is_contiguous(), out.shape
+    if n:
+        _engram_gather_kernel[(n,)](
+            weight_ptr,
+            scale_ptr,
+            row_ids,
+            out,
+            int(global_start),
+            int(local_rows),
+            EMB_DIM=embed_dim,
+            GROUP=group,
+            BLOCK_D=triton.next_power_of_2(embed_dim),
+            num_warps=_NUM_WARPS,
+        )
+    return out
+
+
+__all__ = ["engram_gather_rows", "ple_gather_rows"]

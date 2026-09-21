@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
 
-import torch
-
 # -1 selects the whole dimension: (-1, -1) one scale per tensor, (1, -1) one per output row, (1, 16) one per 16 input elements, (128, 128) a 2-D block
 GroupShape = tuple[int, int]
 
@@ -26,6 +24,7 @@ class QuantKind(Enum):
 
 
 FP8_BLOCK = 128
+FP8_BLOCK_SIZES = frozenset({32, 128})
 NVFP4_GROUP = 16
 MX_GROUP = 32
 
@@ -80,8 +79,16 @@ def fp8_tensor_scheme(scale: str, *, per_row: bool = False, input_scale: bool = 
     return QuantScheme(QuantKind.FP8_TENSOR, WeightDesc("e4m3", (1, -1) if per_row else (-1, -1), scale), roles)
 
 
-def fp8_block_scheme(scale: str) -> QuantScheme:
-    return QuantScheme(QuantKind.FP8_BLOCK, WeightDesc("e4m3", (FP8_BLOCK, FP8_BLOCK), scale), {"weight", "weight_scale_inv"})
+def fp8_block_scheme(scale: str, block_size: int = FP8_BLOCK) -> QuantScheme:
+    if block_size not in FP8_BLOCK_SIZES:
+        raise ValueError(
+            f"FP8 block size must be one of {sorted(FP8_BLOCK_SIZES)}, got {block_size}"
+        )
+    return QuantScheme(
+        QuantKind.FP8_BLOCK,
+        WeightDesc("e4m3", (block_size, block_size), scale),
+        {"weight", "weight_scale_inv"},
+    )
 
 
 def mxfp8_scheme() -> QuantScheme:
